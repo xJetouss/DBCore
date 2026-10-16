@@ -1,0 +1,1852 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DBCore – Funktionsreferenz</title>
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      :root {
+        --bg: #0b0b0c;
+        --surface: #111113;
+        --surface-2: #17171a;
+        --border: #232327;
+        --border-strong: #2e2e34;
+        --fg: #e7e7ea;
+        --fg-2: #b8b8bf;
+        --muted: #7a7a85;
+        --muted-2: #4d4d55;
+        --accent: #e7e7ea;
+        --accent-soft: #1c1c20;
+        --code-bg: #16161a;
+        --code-fg: #e2e2e6;
+        --radius: 6px;
+        --mono:
+          ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        --sidebar: 270px;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        font:
+          15px/1.65 -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      a {
+        color: var(--fg);
+        text-decoration: none;
+      }
+      a:hover {
+        color: #fff;
+      }
+      code,
+      kbd {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--surface-2);
+        padding: 0.1em 0.4em;
+        border-radius: 4px;
+        color: var(--fg-2);
+      }
+      pre {
+        background: var(--code-bg);
+        color: var(--code-fg);
+        padding: 1.1rem 1.25rem;
+        border-radius: var(--radius);
+        overflow-x: auto;
+        font-size: 0.84em;
+        line-height: 1.6;
+        border: 1px solid var(--border);
+        margin: 1rem 0;
+      }
+      pre code {
+        background: none;
+        padding: 0;
+        color: inherit;
+        font-size: 1em;
+      }
+      h1,
+      h2,
+      h3,
+      h4 {
+        letter-spacing: -0.02em;
+        line-height: 1.25;
+        color: var(--fg);
+        font-weight: 600;
+      }
+      h1 {
+        font-size: 1.7rem;
+        margin: 0 0 0.35rem;
+        font-weight: 650;
+      }
+      h2 {
+        font-size: 1.2rem;
+        margin: 3rem 0 0.9rem;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--border);
+        color: #fff;
+      }
+      h2:first-of-type {
+        border-top: none;
+        padding-top: 0;
+        margin-top: 1.5rem;
+      }
+      h3 {
+        font-size: 0.98rem;
+        margin: 1.75rem 0 0.5rem;
+        color: #fff;
+      }
+      h4 {
+        font-size: 0.75rem;
+        margin: 1.5rem 0 0.4rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.09em;
+        font-weight: 600;
+      }
+      p {
+        margin: 0.65rem 0;
+        color: var(--fg-2);
+      }
+      ul,
+      ol {
+        margin: 0.6rem 0;
+        padding-left: 1.2rem;
+        color: var(--fg-2);
+      }
+      li {
+        margin: 0.3rem 0;
+      }
+      li::marker {
+        color: var(--muted-2);
+      }
+      strong {
+        color: var(--fg);
+        font-weight: 600;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.88em;
+        margin: 0.9rem 0;
+      }
+      th,
+      td {
+        border: 1px solid var(--border);
+        padding: 0.55rem 0.75rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: var(--surface-2);
+        font-weight: 600;
+        color: var(--fg);
+        font-size: 0.94em;
+      }
+      td {
+        color: var(--fg-2);
+      }
+      td code {
+        white-space: nowrap;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: var(--sidebar) 1fr;
+        min-height: 100vh;
+      }
+      @media (max-width: 900px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+        .side {
+          position: static !important;
+          height: auto !important;
+          border-right: none !important;
+          border-bottom: 1px solid var(--border);
+        }
+      }
+      .side {
+        position: sticky;
+        top: 0;
+        height: 100vh;
+        overflow-y: auto;
+        padding: 1.5rem 1rem 3rem;
+        background: var(--bg);
+        border-right: 1px solid var(--border);
+      }
+      .side::-webkit-scrollbar {
+        width: 8px;
+      }
+      .side::-webkit-scrollbar-thumb {
+        background: var(--border);
+        border-radius: 4px;
+      }
+      .side::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      .side .logo {
+        font-weight: 650;
+        font-size: 1rem;
+        margin-bottom: 0.1rem;
+        color: #fff;
+        letter-spacing: -0.02em;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+      .side .logo::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: var(--fg);
+        opacity: 0.9;
+      }
+      .side .ver {
+        color: var(--muted);
+        font-size: 0.72em;
+        margin-bottom: 1.5rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        font-weight: 500;
+        padding-left: 1.05rem;
+      }
+      .side nav a {
+        display: block;
+        padding: 0.28rem 0.6rem;
+        border-radius: 4px;
+        color: var(--fg-2);
+        text-decoration: none;
+        font-size: 0.85em;
+        line-height: 1.4;
+        transition:
+          background 0.08s,
+          color 0.08s;
+      }
+      .side nav a:hover {
+        background: var(--surface-2);
+        color: #fff;
+      }
+      .side nav .grp {
+        margin-top: 1.1rem;
+        padding: 0.3rem 0.6rem 0.2rem;
+        font-size: 0.68em;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted-2);
+        font-weight: 600;
+      }
+      .side nav .grp:first-child {
+        margin-top: 0;
+      }
+      .side nav .sub {
+        padding-left: 1.2rem;
+      }
+      main {
+        padding: 3rem 3rem 6rem;
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      @media (max-width: 900px) {
+        main {
+          padding: 2rem 1.5rem 4rem;
+        }
+      }
+      .hero {
+        margin-bottom: 2rem;
+      }
+      .hero .pills {
+        display: flex;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+      }
+      .pill {
+        display: inline-block;
+        background: var(--surface-2);
+        color: var(--muted);
+        border: 1px solid var(--border);
+        font-size: 0.68em;
+        font-weight: 600;
+        padding: 0.25em 0.6em;
+        border-radius: 999px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+      .hero p {
+        color: var(--muted);
+        margin: 0.6rem 0 0;
+        font-size: 1.02em;
+        max-width: 60ch;
+      }
+      .note {
+        background: var(--surface);
+        border-left: 2px solid var(--border-strong);
+        padding: 0.75rem 1rem;
+        border-radius: 0 var(--radius) var(--radius) 0;
+        margin: 1rem 0;
+        font-size: 0.9em;
+        color: var(--fg-2);
+      }
+      .warn {
+        background: #1a1410;
+        border-left: 2px solid #b8804a;
+        padding: 0.75rem 1rem;
+        border-radius: 0 var(--radius) var(--radius) 0;
+        margin: 1rem 0;
+        font-size: 0.9em;
+        color: #e8c9a8;
+      }
+      .warn strong {
+        color: #f5d5b0;
+      }
+      dl {
+        display: grid;
+        grid-template-columns: minmax(9rem, 13rem) 1fr;
+        gap: 0.5rem 1.25rem;
+        font-size: 0.9em;
+        margin: 1rem 0;
+        padding: 0;
+      }
+      dt {
+        font-family: var(--mono);
+        color: var(--fg);
+        font-size: 0.92em;
+        word-break: break-word;
+        padding-top: 0.05rem;
+      }
+      dt::before {
+        content: "› ";
+        color: var(--muted-2);
+      }
+      dd {
+        margin: 0;
+        color: var(--fg-2);
+      }
+      @media (max-width: 600px) {
+        dl {
+          grid-template-columns: 1fr;
+          gap: 0.15rem;
+        }
+        dd {
+          margin-bottom: 0.75rem;
+          padding-left: 1.15rem;
+          border-left: 1px solid var(--border);
+          margin-left: 0.2rem;
+        }
+      }
+      .sig {
+        font-family: var(--mono);
+        font-size: 0.85em;
+        background: var(--surface-2);
+        padding: 0.5rem 0.7rem;
+        border-radius: 4px;
+        display: block;
+        margin: 0.35rem 0;
+        overflow-x: auto;
+        white-space: pre;
+        border: 1px solid var(--border);
+        color: var(--fg-2);
+      }
+      footer {
+        margin-top: 4rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid var(--border);
+        color: var(--muted-2);
+        font-size: 0.82em;
+      }
+      ::selection {
+        background: #2b2b31;
+        color: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="side">
+        <div class="logo">DBCore</div>
+        <div class="ver">Funktionsreferenz</div>
+        <nav>
+          <div class="grp">Grundlagen</div>
+          <a href="#dbcore">DBCore – das Handle</a>
+          <a href="#einstellungen">Einstellungen</a>
+
+          <div class="grp">Schema</div>
+          <a href="#schema-makro">schema! Makro</a>
+          <a href="#schemabuilder">Schema-Builder</a>
+          <a href="#columndef">ColumnDef</a>
+          <a href="#colkind">ColumnKind</a>
+          <a href="#constraints">Constraints</a>
+          <a href="#check">Check</a>
+          <a href="#ondelete">OnDelete</a>
+
+          <div class="grp">Zeilen</div>
+          <a href="#row-makro">row! Makro</a>
+          <a href="#crud">Zeilen schreiben</a>
+          <a href="#lesen">Zeilen lesen</a>
+          <a href="#row">Row – Zugriff</a>
+          <a href="#fromcell">FromCell / FromRow</a>
+          <a href="#model-makro">model! Makro</a>
+
+          <div class="grp">Abfragen</div>
+          <a href="#table">Table – Query-Builder</a>
+          <a href="#where">WHERE-Bedingungen</a>
+          <a href="#order">Sortieren &amp; Limit</a>
+          <a href="#select">Projektion &amp; DISTINCT</a>
+          <a href="#joins">Joins</a>
+          <a href="#groupby">Gruppierung &amp; Agg</a>
+          <a href="#mengen">Union &amp; Unterabfragen</a>
+          <a href="#terminal">Terminal-Methoden</a>
+          <a href="#streaming">Streaming &amp; Iteration</a>
+          <a href="#mutation">Mutationen über Abfragen</a>
+          <a href="#explain">explain() – Plan</a>
+          <a href="#agg">Agg</a>
+
+          <div class="grp">Transaktion &amp; Lesen</div>
+          <a href="#tx">Tx – Transaktion</a>
+          <a href="#snapshot">Snapshot</a>
+
+          <div class="grp">Migration &amp; Wartung</div>
+          <a href="#indizes">Indizes</a>
+          <a href="#migration">Schema-Änderungen</a>
+          <a href="#migrate">migrate()</a>
+          <a href="#wartung">Integritätsprüfung</a>
+
+          <div class="grp">Ausgabe</div>
+          <a href="#export">CSV / JSON / HTML</a>
+          <a href="#web">Web-Interface</a>
+
+          <div class="grp">Fehler &amp; Hilfen</div>
+          <a href="#fehler">DbError</a>
+          <a href="#weitere-makros">remove_if!, with!</a>
+          <a href="#konstanten">Konstanten &amp; Typen</a>
+        </nav>
+      </aside>
+
+      <main>
+        <header class="hero">
+          <div class="pills">
+            <span class="pill">Embedded</span>
+            <span class="pill">Verschlüsselt</span>
+            <span class="pill">ACID</span>
+          </div>
+          <h1>DBCore – Funktionsreferenz</h1>
+          <p>
+            Die vollständige öffentliche API der Bibliothek: jedes Handle, jede
+            Builder-Methode, jedes Makro, jeden Terminal-Aufruf und jeden
+            Fehlertyp.
+          </p>
+        </header>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="dbcore">
+          <h2>DBCore – das Datenbank-Handle</h2>
+          <p>
+            Ein <code>DBCore</code>-Wert ist ein billig klonbares Handle auf ein
+            Datenbankverzeichnis (<code>Clone + Send + Sync</code>). Alle
+            folgenden Methoden sind auf diesem Handle verfügbar.
+          </p>
+
+          <h3>Konstruktoren</h3>
+          <dl>
+            <dt>new(name: &amp;str)</dt>
+            <dd>
+              Öffnet die Datenbank. Ein reiner Name (<code>"HI"</code>) landet
+              unter <code>./dbcore_data/HI</code>; ein Pfad
+              (<code>"./db"</code>, <code>"/abs"</code>) wird direkt verwendet.
+            </dd>
+            <dt>at(path)</dt>
+            <dd>Öffnet das angegebene Verzeichnis.</dd>
+            <dt>under(base, name)</dt>
+            <dd>Öffnet <code>base/name</code>.</dd>
+            <dt>temp()</dt>
+            <dd>
+              Wegwerf-Datenbank in einem Temp-Verzeichnis; wird beim letzten
+              Handle gelöscht.
+            </dd>
+          </dl>
+          <p>
+            Die Kurzformen melden Fehler auf <code>stderr</code> und liefern ein
+            „geschlossenes“ Handle (<code>is_open() == false</code>). Die
+            <code>try_*</code>-Varianten liefern
+            <code>Result&lt;DBCore, DbError&gt;</code>:
+          </p>
+          <dl>
+            <dt>try_new / try_at / try_under / try_temp</dt>
+            <dd>wie oben, mit echtem Fehler.</dd>
+          </dl>
+
+          <h3>Zustand &amp; Pfad</h3>
+          <dl>
+            <dt>path() → &amp;Path</dt>
+            <dd>Das Verzeichnis der Datenbank.</dd>
+            <dt>is_open() → bool</dt>
+            <dd>
+              <code>true</code>, wenn die Datenbank geöffnet ist (Schlüssel
+              geladen).
+            </dd>
+          </dl>
+
+          <h3>Tabellen verwalten</h3>
+          <dl>
+            <dt>create(name, schema) → bool</dt>
+            <dd>Legt eine Tabelle an. Fehler, wenn sie schon existiert.</dd>
+            <dt>create_if_missing(name, schema) → bool</dt>
+            <dd>Wie <code>create</code>, aber ohne Fehler bei Existenz.</dd>
+            <dt>delete_table(table) → bool</dt>
+            <dd>Löscht eine Tabelle (muss existieren).</dd>
+            <dt>delete_table_if_exists(table) → bool</dt>
+            <dd>Löscht ohne Fehler, wenn sie fehlt.</dd>
+            <dt>tables() → Vec&lt;String&gt;</dt>
+            <dd>Alle Tabellennamen, alphabetisch.</dd>
+            <dt>has_table(table) → bool</dt>
+            <dd>Existiert die Tabelle?</dd>
+            <dt>
+              try_create / try_create_if_missing / try_delete_table / try_tables
+              / try_has_table
+            </dt>
+            <dd>
+              wie oben, mit <code>Result</code>.
+              <code>try_delete_table(table, if_exists: bool)</code>.
+            </dd>
+          </dl>
+
+          <h3>Zeilen schreiben</h3>
+          <dl>
+            <dt>add(table, values) → bool</dt>
+            <dd>Fügt eine Zeile ein. Doppelte Keys werden abgelehnt.</dd>
+            <dt>put(table, values) → String</dt>
+            <dd>
+              Upsert. Liefert den (ggf. automatisch vergebenen) Key oder
+              <code>""</code> bei Fehler.
+            </dd>
+            <dt>update(table, key, values) → bool</dt>
+            <dd>
+              Partielles Update per Key. <code>true</code> = Zeile gefunden und
+              geändert.
+            </dd>
+            <dt>remove(table, key) → bool</dt>
+            <dd>Löscht per Key (inkl. <code>ON DELETE CASCADE</code>).</dd>
+            <dt>put_many(table, rows) → Vec&lt;String&gt;</dt>
+            <dd>Viele Upserts in einem Commit (alles oder nichts).</dd>
+            <dt>add_many(table, rows) → bool</dt>
+            <dd>Viele Inserts in einem Commit (alles oder nichts).</dd>
+            <dt>
+              try_add / try_put / try_update / try_remove / try_put_many /
+              try_add_many
+            </dt>
+            <dd>
+              wie oben, mit <code>Result</code>. <code>values</code> ist ein
+              <code>Vec&lt;(&amp;str, String)&gt;</code> – siehe
+              <a href="#row-makro">row!</a>.
+            </dd>
+          </dl>
+
+          <h3>Zeilen lesen</h3>
+          <dl>
+            <dt>print(table)</dt>
+            <dd>
+              Gibt die Tabelle als Textraster auf <code>stdout</code> aus.
+            </dd>
+            <dt>count(table) → usize</dt>
+            <dd>Anzahl Zeilen (0 bei Fehler).</dd>
+            <dt>all(table) → Vec&lt;Vec&lt;String&gt;&gt;</dt>
+            <dd>Alle Zeilen.</dd>
+            <dt>get(table, key) → Vec&lt;String&gt;</dt>
+            <dd>Zeile per Key. Leerer Vektor = nicht gefunden oder Fehler.</dd>
+            <dt>has(table, key) → bool</dt>
+            <dd>Gibt es die Zeile?</dd>
+            <dt>try_count / try_all / try_get</dt>
+            <dd>
+              mit <code>Result</code>; <code>try_get</code> liefert
+              <code>Result&lt;Option&lt;Vec&lt;String&gt;&gt;&gt;</code>.
+            </dd>
+          </dl>
+
+          <h3>Abfrage starten</h3>
+          <dl>
+            <dt>table(name) → Table</dt>
+            <dd>
+              Einstieg in den Query-Builder (siehe <a href="#table">Table</a>).
+            </dd>
+          </dl>
+
+          <h3>Schema ändern (Kurzformen)</h3>
+          <p>
+            Alle laufen als eigene Transaktion. <code>try_*</code>-Varianten
+            liefern <code>Result</code>.
+          </p>
+          <dl>
+            <dt>create_index(table, col) → bool</dt>
+            <dd>Sekundärer (nicht eindeutiger) Index.</dd>
+            <dt>create_unique_index(table, col) → bool</dt>
+            <dd>Eindeutiger Index.</dd>
+            <dt>drop_index(table, col) → bool</dt>
+            <dd>Entfernt einen Index.</dd>
+            <dt>indexes(table) → Vec&lt;String&gt;</dt>
+            <dd>
+              Indizierte Spalten (inkl. <code>@key</code> und
+              <code>UNIQUE</code>).
+            </dd>
+            <dt>add_field(table, col) → bool</dt>
+            <dd>Neue Spalte. Bestehende Zeilen brauchen einen Default.</dd>
+            <dt>rename_field(table, old, new) → bool</dt>
+            <dd>Spalte umbenennen (Foreign Keys werden mitgeführt).</dd>
+            <dt>remove_field(table, col) → bool</dt>
+            <dd>Spalte entfernen (schlägt fehl, wenn referenziert).</dd>
+            <dt>rename_table(old, new) → bool</dt>
+            <dd>Tabelle umbenennen.</dd>
+          </dl>
+
+          <h3>Version &amp; Migration</h3>
+          <dl>
+            <dt>user_version() → u32</dt>
+            <dd>Schema-Versionsnummer (Start: 0).</dd>
+            <dt>set_user_version(v) → bool</dt>
+            <dd>Setzt die Versionsnummer.</dd>
+            <dt>migrate(steps) → Result&lt;u32&gt;</dt>
+            <dd>
+              Führt alle Schritte mit Version &gt; aktueller Version atomar aus.
+              Siehe <a href="#migrate">migrate()</a>.
+            </dd>
+          </dl>
+
+          <h3>Modelle</h3>
+          <dl>
+            <dt>create_model::&lt;M&gt;(table) → bool</dt>
+            <dd>Legt eine Tabelle aus <code>M::schema()</code> an.</dd>
+            <dt>put_model(table, &amp;m) → String</dt>
+            <dd>Upsert des Modells (liefert Key).</dd>
+          </dl>
+
+          <h3>Wartung</h3>
+          <dl>
+            <dt>integrity_check() → Vec&lt;String&gt;</dt>
+            <dd>
+              Leerer Vektor = OK. Prüft Entschlüsselung/Authentizität aller
+              Blöcke, Typen, <code>NOT NULL</code>, <code>CHECK</code>,
+              <code>UNIQUE</code>/Key-Duplikate und Foreign Keys.
+            </dd>
+          </dl>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="einstellungen">
+          <h2>Einstellungen</h2>
+          <p>
+            Werden auf dem <code>DBCore</code>-Handle gesetzt und gelten für
+            alle Klone.
+          </p>
+          <dl>
+            <dt>set_busy_timeout(d: Duration)</dt>
+            <dd>
+              Maximale Wartezeit auf den Schreib-Lock (Standard 10 s). Wird sie
+              überschritten, kommt <code>DbError::Busy</code>.
+            </dd>
+            <dt>set_sync(on: bool)</dt>
+            <dd>
+              <code>false</code> = kein <code>fsync</code> – schneller, aber
+              nicht stromausfallsicher.
+            </dd>
+            <dt>set_cache(on: bool)</dt>
+            <dd>
+              Tabellen-Cache an/aus (Standard an). Aus = minimaler
+              Speicherverbrauch.
+            </dd>
+            <dt>clear_cache()</dt>
+            <dd>Verwirft alle im Speicher gehaltenen Tabellen.</dd>
+          </dl>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="schema-makro">
+          <h2>schema! – Tabellenschema deklarieren</h2>
+          <p>
+            Baut einen <code>Schema</code>-Wert aus Spalten. Jede Spalte hat
+            Name, Typ und optional einen Default. <code>@key</code> markiert den
+            Primärschlüssel.
+          </p>
+          <pre><code>schema! {
+    @key id: i32,
+    name: String,
+    views: i64 = 0,
+}</code></pre>
+          <p>Typen für die Spalten:</p>
+          <ul>
+            <li><code>String</code>, <code>&amp;str</code> → Text</li>
+            <li>
+              <code>i8</code> … <code>i64</code>, <code>isize</code>,
+              <code>u8</code> … <code>u64</code>, <code>usize</code> → Int
+            </li>
+            <li><code>f32</code>, <code>f64</code> → Float</li>
+            <li><code>bool</code> → Bool</li>
+          </ul>
+          <div class="note">
+            Der Default ist optional. Int-Spalten mit Default vergeben fehlende
+            Keys automatisch fortlaufend.
+          </div>
+        </section>
+
+        <section id="schemabuilder">
+          <h2>Schema-Builder</h2>
+          <p>
+            Auf dem von <code>schema!</code> erzeugten Wert lassen sich
+            Constraints und Indizes verfeinern. Alle Methoden geben das
+            <code>Schema</code> zurück (verkettbar).
+          </p>
+          <dl>
+            <dt>columns() → &amp;[ColumnDef]</dt>
+            <dd>Die definierten Spalten.</dd>
+            <dt>not_null(&amp;[&amp;str])</dt>
+            <dd>Spalten dürfen nicht leer sein.</dd>
+            <dt>unique(&amp;[&amp;str])</dt>
+            <dd>Spalten müssen eindeutig sein (erzeugt einen Index).</dd>
+            <dt>index(&amp;[&amp;str])</dt>
+            <dd>Sekundärer (nicht eindeutiger) Index.</dd>
+            <dt>check(col, Check)</dt>
+            <dd>
+              <code>CHECK</code>-Bedingung für eine Spalte (mehrfach aufrufbar).
+            </dd>
+            <dt>references(col, table, column, OnDelete)</dt>
+            <dd>
+              Foreign Key auf <code>table.column</code> (dort muss
+              <code>@key</code> oder <code>UNIQUE</code> liegen).
+            </dd>
+          </dl>
+        </section>
+
+        <section id="columndef">
+          <h2>ColumnDef</h2>
+          <p>
+            Eine einzelne Spaltendefinition. Wird vom Makro erzeugt, kann aber
+            auch direkt gebaut werden – z. B. für <code>add_field</code>.
+          </p>
+          <dl>
+            <dt>new(name, kind, default, key)</dt>
+            <dd>
+              Konstruktor. <code>default: Option&lt;String&gt;</code>,
+              <code>key: bool</code>.
+            </dd>
+            <dt>name() → &amp;str</dt>
+            <dd>Spaltenname.</dd>
+            <dt>kind() → ColumnKind</dt>
+            <dd>Spaltentyp.</dd>
+            <dt>default_value() → Option&lt;&amp;str&gt;</dt>
+            <dd>Default-Wert.</dd>
+            <dt>is_key() → bool</dt>
+            <dd>Ist die Spalte der Primärschlüssel?</dd>
+            <dt>is_not_null() → bool</dt>
+            <dd>NOT-NULL-Flag.</dd>
+            <dt>is_unique() → bool</dt>
+            <dd>UNIQUE oder Key.</dd>
+            <dt>is_indexed() → bool</dt>
+            <dd>
+              Hat die Spalte einen Index (auch implizit durch Key/Unique)?
+            </dd>
+            <dt>checks() → &amp;[Check]</dt>
+            <dd>Alle CHECK-Bedingungen.</dd>
+            <dt>foreign_key() → Option&lt;&amp;ForeignKey&gt;</dt>
+            <dd>Referenz, falls vorhanden.</dd>
+            <dt>not_null() / unique() / indexed()</dt>
+            <dd>Builder-Varianten, die die Flags setzen.</dd>
+            <dt>with_check(Check)</dt>
+            <dd>Fügt einen Check hinzu.</dd>
+            <dt>with_reference(table, column, OnDelete)</dt>
+            <dd>Setzt einen Foreign Key.</dd>
+          </dl>
+        </section>
+
+        <section id="colkind">
+          <h2>ColumnKind</h2>
+          <p>Der Datentyp einer Spalte.</p>
+          <ul>
+            <li><code>Int</code> – Ganzzahl</li>
+            <li><code>Float</code> – Kommazahl</li>
+            <li><code>Text</code> – Zeichenkette</li>
+            <li><code>Bool</code> – <code>true</code> / <code>false</code></li>
+          </ul>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="constraints">
+          <h2>Constraints im Überblick</h2>
+          <p>
+            Constraints werden beim Schreiben jeder Zeile geprüft. Verstöße
+            liefern eigene Fehler (siehe <a href="#fehler">DbError</a>):
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Constraint</th>
+                <th>Wirkung</th>
+                <th>Fehler</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Typ</td>
+                <td>Wert muss zum Spaltentyp passen.</td>
+                <td><code>TypeMismatch</code></td>
+              </tr>
+              <tr>
+                <td><code>NOT NULL</code></td>
+                <td>Zelle darf nicht leer sein.</td>
+                <td><code>NotNull</code></td>
+              </tr>
+              <tr>
+                <td><code>UNIQUE</code></td>
+                <td>Wert darf nur einmal vorkommen (leer zählt nicht).</td>
+                <td><code>Unique</code></td>
+              </tr>
+              <tr>
+                <td><code>@key</code></td>
+                <td>Primärschlüssel (implizit UNIQUE + NOT NULL).</td>
+                <td><code>DuplicateKey</code></td>
+              </tr>
+              <tr>
+                <td><code>CHECK</code></td>
+                <td>Bedingung aus <a href="#check">Check</a>.</td>
+                <td><code>CheckFailed</code></td>
+              </tr>
+              <tr>
+                <td>Foreign Key</td>
+                <td>Verweis muss in der Parent-Tabelle existieren.</td>
+                <td><code>ForeignKey</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="check">
+          <h2>Check – Bedingungen</h2>
+          <p>
+            Für <code>CHECK</code>-Constraints und Vergleiche. Jede Funktion
+            liefert einen <code>Check</code>.
+          </p>
+          <dl>
+            <dt>eq(v) / ne(v)</dt>
+            <dd>Gleich / ungleich.</dd>
+            <dt>lt(v) / le(v) / gt(v) / ge(v)</dt>
+            <dd>&lt;, ≤, &gt;, ≥.</dd>
+            <dt>between(lo, hi)</dt>
+            <dd>Bereich <code>[lo, hi]</code> (inklusive).</dd>
+            <dt>one_of(items)</dt>
+            <dd>Aufzählung – Wert muss in der Liste vorkommen.</dd>
+            <dt>len(min, max)</dt>
+            <dd>Textlänge in Zeichen (nur Text).</dd>
+            <dt>like(pattern)</dt>
+            <dd>
+              SQL-LIKE: <code>%</code> = beliebig viele Zeichen,
+              <code>_</code> = genau eins. ASCII-case-insensitive.
+            </dd>
+          </dl>
+        </section>
+
+        <section id="ondelete">
+          <h2>OnDelete – Fremdschlüsselverhalten</h2>
+          <dl>
+            <dt>Restrict</dt>
+            <dd>
+              Löschen wird abgelehnt, solange referenzierende Kinder existieren
+              (Standard).
+            </dd>
+            <dt>Cascade</dt>
+            <dd>Kinder werden mitgelöscht (rekursiv).</dd>
+          </dl>
+          <p>
+            Ein <code>ForeignKey</code>-Wert selbst hat die Felder
+            <code>table</code>, <code>column</code> und
+            <code>on_delete</code> und ist über
+            <code>ColumnDef::foreign_key()</code> abrufbar.
+          </p>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="row-makro">
+          <h2>row! – Werte einer Zeile angeben</h2>
+          <p>
+            Erzeugt einen <code>Vec&lt;(&amp;str, String)&gt;</code> aus
+            Spaltenname und Wert. Wird von allen Schreibmethoden erwartet.
+          </p>
+          <pre><code>row! { id: 1, name: "Alice", views: 5 }</code></pre>
+          <p>
+            Nicht angegebene Spalten werden mit ihrem Default oder – bei
+            Int-Keys – automatisch befüllt.
+          </p>
+        </section>
+
+        <section id="crud">
+          <h2>Zeilen schreiben</h2>
+          <p>
+            Alle Schreiboperationen laufen – sofern nicht innerhalb einer
+            <a href="#tx">Tx</a> aufgerufen – automatisch als atomare
+            Transaktion.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Methode</th>
+                <th>Wirkung</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>add</code></td>
+                <td>
+                  Insert. Fehler, wenn ein
+                  <code>@key</code>/<code>UNIQUE</code>-Wert schon existiert.
+                </td>
+              </tr>
+              <tr>
+                <td><code>put</code></td>
+                <td>
+                  Upsert per <code>@key</code>. Fehlt der Key (bei Int), wird er
+                  vergeben.
+                </td>
+              </tr>
+              <tr>
+                <td><code>update</code></td>
+                <td>
+                  Partielles Update per Key: nur übergebene Spalten werden
+                  geändert.
+                </td>
+              </tr>
+              <tr>
+                <td><code>remove</code></td>
+                <td>
+                  Löscht per Key; löst ggf. Kaskaden und Restriktionen aus.
+                </td>
+              </tr>
+              <tr>
+                <td><code>add_many</code> / <code>put_many</code></td>
+                <td>Viele Zeilen in einem Commit – alles oder nichts.</td>
+              </tr>
+            </tbody>
+          </table>
+          <p>
+            Auf jeder gibt es eine <code>try_*</code>-Variante mit
+            <code>Result</code>. Ob ein Key gelöscht wurde, liefert nur
+            <code>try_remove</code> sauber (<code>Ok(true)</code> = entfernt,
+            <code>Ok(false)</code> = nicht vorhanden).
+          </p>
+        </section>
+
+        <section id="lesen">
+          <h2>Zeilen lesen</h2>
+          <dl>
+            <dt>print(table)</dt>
+            <dd>Terminal-Raster mit Rahmen.</dd>
+            <dt>count(table) / try_count(table)</dt>
+            <dd>Anzahl Zeilen.</dd>
+            <dt>all(table) / try_all(table)</dt>
+            <dd>Alle Zeilen als <code>Vec&lt;Vec&lt;String&gt;&gt;</code>.</dd>
+            <dt>get(table, key) / has(table, key)</dt>
+            <dd>Zeile per Key bzw. Existenzprüfung.</dd>
+            <dt>
+              try_get(table, key) →
+              Result&lt;Option&lt;Vec&lt;String&gt;&gt;&gt;
+            </dt>
+            <dd>Unterscheidet „fehlt“ von „Fehler“.</dd>
+          </dl>
+          <p>
+            Für alles Weitere (Filter, Sortierung, Joins, Aggregate …) den
+            Query-Builder <a href="#table">Table</a> verwenden.
+          </p>
+        </section>
+
+        <section id="row">
+          <h2>Row – Zugriff auf Zellen</h2>
+          <p>
+            Eine <code>Row</code> ist eine geliehene Sicht auf eine Zeile
+            zusammen mit dem Schema. In Closures (z.&nbsp;B.
+            <code>filter</code>) erhält man sie als Argument.
+          </p>
+          <dl>
+            <dt>len() / is_empty()</dt>
+            <dd>Anzahl bzw. Fehlen von Zellen.</dd>
+            <dt>cells() → &amp;[String]</dt>
+            <dd>Alle Rohwerte.</dd>
+            <dt>iter() → Iterator&lt;Item=&amp;String&gt;</dt>
+            <dd>Iteration über die Zellen.</dd>
+            <dt>columns() → Iterator&lt;Item=&amp;str&gt;</dt>
+            <dd>Spaltennamen.</dd>
+            <dt>str(col) → Option&lt;&amp;str&gt;</dt>
+            <dd>
+              Rohwert einer Spalte (<code>None</code> = Spalte unbekannt).
+            </dd>
+            <dt>get::&lt;T&gt;(col) → DbResult&lt;T&gt;</dt>
+            <dd>Typisierter Zugriff nach Namen.</dd>
+            <dt>get_at::&lt;T&gt;(i) → DbResult&lt;T&gt;</dt>
+            <dd>Typisierter Zugriff nach Position.</dd>
+            <dt>r[i] → String</dt>
+            <dd>Zugriff nach Position (fehlend = <code>""</code>).</dd>
+            <dt>r["name"] → String</dt>
+            <dd>
+              Zugriff nach Namen; unbekannte Spalte = <code>""</code> + Warnung.
+            </dd>
+          </dl>
+        </section>
+
+        <section id="fromcell">
+          <h2>FromCell, FromRow, Model</h2>
+          <p>Traits, die Zellen bzw. Zeilen in Rust-Typen umwandeln.</p>
+          <h4>FromCell</h4>
+          <p>
+            Implementiert für alle Standardtypen (<code>i8</code> …
+            <code>i64</code>, <code>u8</code> … <code>usize</code>,
+            <code>f32</code>, <code>f64</code>, <code>bool</code>,
+            <code>String</code>) sowie <code>Option&lt;T&gt;</code> (leere Zelle
+            → <code>None</code>).
+          </p>
+          <h4>FromRow</h4>
+          <p>
+            Wandelt eine <code>Row</code> in einen eigenen Typ.
+            <code>from_row(Row) → DbResult&lt;Self&gt;</code>.
+          </p>
+          <h4>Model</h4>
+          <p>
+            Erweitert <code>FromRow</code>: <code>schema() → Schema</code> und
+            <code>to_values() → Vec&lt;(&amp;'static str, String)&gt;</code>.
+            Wird vom <a href="#model-makro">model!</a>-Makro automatisch
+            generiert.
+          </p>
+        </section>
+
+        <section id="model-makro">
+          <h2>model! – Struct, Schema und Konvertierung in einem</h2>
+          <p>
+            Deklariert ein Struct und implementiert <code>FromRow</code>,
+            <code>Model</code> und <code>schema!</code> dafür. Attribute wie
+            <code>#[derive(...)]</code> werden durchgereicht.
+          </p>
+          <pre><code>model! {
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct User {
+        @key id: i32,
+        name: String,
+        views: i64 = 0,
+    }
+}</code></pre>
+          <p>Zusammenspiel mit dem Handle:</p>
+          <dl>
+            <dt>create_model::&lt;M&gt;(table)</dt>
+            <dd>Legt die Tabelle aus <code>M::schema()</code> an.</dd>
+            <dt>put_model(table, &amp;m)</dt>
+            <dd>Upsert eines Modells (liefert den Key).</dd>
+            <dt>table.collect_as::&lt;T&gt;()</dt>
+            <dd>Liest Zeilen als <code>Vec&lt;T&gt;</code>.</dd>
+            <dt>table.first_as::&lt;T&gt;()</dt>
+            <dd>Erste Zeile als <code>Option&lt;T&gt;</code>.</dd>
+          </dl>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="table">
+          <h2>Table – der Query-Builder</h2>
+          <p>
+            Einstieg über <code>db.table("name")</code>,
+            <code>tx.table("name")</code> oder
+            <code>snapshot.table("name")</code>. Alle Builder-Methoden
+            konsumieren <code>self</code> und geben es zurück – frei verkettbar.
+          </p>
+          <p>
+            <strong>Auswertungsreihenfolge:</strong> Quelle/Join →
+            <code>where</code> → <code>group_by</code>/<code>agg</code> →
+            <code>having</code> → <code>order_by</code> → <code>select</code> →
+            <code>distinct</code> → <code>skip</code> → <code>limit</code>.
+          </p>
+        </section>
+
+        <section id="where">
+          <h2>WHERE-Bedingungen</h2>
+          <p>
+            Alle Bedingungen werden mit UND verknüpft. Die
+            <code>where_*</code>-Varianten können einen Index nutzen –
+            <code>filter</code> nicht.
+          </p>
+          <dl>
+            <dt>filter(F)</dt>
+            <dd>
+              Beliebige Closure <code>F: Fn(Row) -&gt; bool</code>. Bequem über
+              <a href="#weitere-makros">with!</a>.
+            </dd>
+            <dt>where_eq(col, v)</dt>
+            <dd>Gleich.</dd>
+            <dt>where_ne(col, v)</dt>
+            <dd>Ungleich.</dd>
+            <dt>where_gt / where_ge</dt>
+            <dd>&gt; / ≥.</dd>
+            <dt>where_lt / where_le</dt>
+            <dd>&lt; / ≤.</dd>
+            <dt>where_between(col, lo, hi)</dt>
+            <dd>Bereich (inklusive).</dd>
+            <dt>where_in(col, iterable)</dt>
+            <dd>Wert in Liste.</dd>
+            <dt>where_like(col, pattern)</dt>
+            <dd>
+              SQL-LIKE (<code>%</code>, <code>_</code>), case-insensitive.
+            </dd>
+            <dt>where_in_query(col, subquery)</dt>
+            <dd>
+              <code>col IN (SELECT …)</code> – erste Spalte der Unterabfrage
+              liefert die Werte.
+            </dd>
+            <dt>where_not_in_query(col, subquery)</dt>
+            <dd>wie oben, negiert.</dd>
+          </dl>
+        </section>
+
+        <section id="order">
+          <h2>Sortieren &amp; Einschränken</h2>
+          <dl>
+            <dt>order_by(col)</dt>
+            <dd>
+              Sortierschlüssel (ersetzt eine frühere Sortierung). Standard:
+              aufsteigend.
+            </dd>
+            <dt>then_by(col)</dt>
+            <dd>Weiterer Sortierschlüssel.</dd>
+            <dt>asc() / desc()</dt>
+            <dd>Richtung des zuletzt gesetzten Schlüssels.</dd>
+            <dt>limit(n)</dt>
+            <dd>Maximal <code>n</code> Zeilen.</dd>
+            <dt>skip(n) / offset(n)</dt>
+            <dd>Erste <code>n</code> Treffer überspringen.</dd>
+          </dl>
+        </section>
+
+        <section id="select">
+          <h2>Projektion &amp; DISTINCT</h2>
+          <dl>
+            <dt>select(&amp;[&amp;str])</dt>
+            <dd>
+              Nur diese Spalten behalten (in dieser Reihenfolge). Namen dürfen
+              <code>tabelle.spalte</code> sein, wenn nötig.
+            </dd>
+            <dt>distinct()</dt>
+            <dd>Doppelte Ergebniszeilen entfernen.</dd>
+          </dl>
+        </section>
+
+        <section id="joins">
+          <h2>Joins</h2>
+          <p>
+            Nach einem Join heißen die Spalten <code>tabelle.spalte</code>. Ohne
+            Präfix sind sie weiter ansprechbar, solange der Name eindeutig ist.
+          </p>
+          <dl>
+            <dt>join(table, left, right)</dt>
+            <dd>
+              INNER JOIN: <code>left = table.right</code>.
+              <code>left</code> kann auch <code>tabelle.spalte</code> sein.
+            </dd>
+            <dt>left_join(table, left, right)</dt>
+            <dd>
+              LEFT JOIN: Zeilen ohne Treffer bleiben, rechte Spalten leer.
+            </dd>
+          </dl>
+          <p>
+            Joins sind auf einfachen Tabellen erlaubt. Auf
+            <code>Union</code> oder <code>Derived</code> (Unterabfrage) liefert
+            ein Join einen <code>Unsupported</code>-Fehler.
+          </p>
+        </section>
+
+        <section id="groupby">
+          <h2>Gruppierung &amp; Aggregate</h2>
+          <dl>
+            <dt>group_by(&amp;[&amp;str])</dt>
+            <dd>Gruppiert nach den angegebenen Spalten.</dd>
+            <dt>agg(&amp;[Agg])</dt>
+            <dd>
+              Hängt Aggregate an. Ohne <code>group_by</code> entsteht genau eine
+              Ergebniszeile – auch bei leerer Eingabe (Count = 0, Sum = 0,
+              Min/Max = <code>""</code>).
+            </dd>
+            <dt>having(F)</dt>
+            <dd>
+              Filtert die gruppierten Zeilen (Closure über <code>Row</code>).
+              Nutze <a href="#weitere-makros">with!</a>.
+            </dd>
+          </dl>
+        </section>
+
+        <section id="mengen">
+          <h2>Mengenoperationen &amp; Unterabfragen</h2>
+          <dl>
+            <dt>union(other)</dt>
+            <dd>
+              Vereinigung ohne Duplikate. Beide Seiten brauchen gleich viele
+              Spalten.
+            </dd>
+            <dt>union_all(other)</dt>
+            <dd>Vereinigung mit Duplikaten.</dd>
+            <dt>Table::from_query(q)</dt>
+            <dd>
+              Unterabfrage in <code>FROM</code>: weitere Bedingungen,
+              Sortierung, Aggregate etc. auf das Ergebnis von <code>q</code>.
+            </dd>
+          </dl>
+        </section>
+
+        <section id="terminal">
+          <h2>Terminal-Methoden</h2>
+          <p>
+            Führen die Abfrage aus. Jede Kurzform hat eine
+            <code>try_*</code>-Variante mit <code>Result</code>.
+          </p>
+
+          <h4>Daten</h4>
+          <dl>
+            <dt>collect() / try_collect()</dt>
+            <dd>Alle Treffer als <code>Vec&lt;Vec&lt;String&gt;&gt;</code>.</dd>
+            <dt>first() / try_first()</dt>
+            <dd>
+              Erste Zeile; leer, wenn keine Treffer.
+              <code>try_first</code> liefert <code>Option</code>.
+            </dd>
+            <dt>value() / try_value()</dt>
+            <dd>Erste Zelle der ersten Zeile.</dd>
+            <dt>values(col) / try_values(col)</dt>
+            <dd>Alle Zellen einer Spalte.</dd>
+            <dt>exists() / try_exists()</dt>
+            <dd>Mindestens ein Treffer?</dd>
+            <dt>collect_as::&lt;T&gt;() / try_collect_as::&lt;T&gt;()</dt>
+            <dd>Zeilen als <code>Vec&lt;T&gt;</code> (Modelle).</dd>
+            <dt>first_as::&lt;T&gt;() / try_first_as::&lt;T&gt;()</dt>
+            <dd>Erste Zeile als <code>Option&lt;T&gt;</code>.</dd>
+          </dl>
+
+          <h4>Aggregate</h4>
+          <dl>
+            <dt>count() / try_count()</dt>
+            <dd>Anzahl Treffer.</dd>
+            <dt>sum(col) / try_sum(col)</dt>
+            <dd>
+              Summe numerischer Zellen (nicht-numerische werden ignoriert).
+            </dd>
+            <dt>avg(col) / try_avg(col)</dt>
+            <dd>
+              Durchschnitt. <code>try_avg</code> liefert <code>Option</code> –
+              <code>None</code> = keine numerischen Werte.
+            </dd>
+            <dt>min(col) / try_min(col)</dt>
+            <dd>Kleinster Wert (typgerecht).</dd>
+            <dt>max(col) / try_max(col)</dt>
+            <dd>Größter Wert (typgerecht).</dd>
+          </dl>
+
+          <h4>Ausgabe</h4>
+          <dl>
+            <dt>print()</dt>
+            <dd>Terminal-Raster auf <code>stdout</code>.</dd>
+            <dt>to_csv() / to_json() / to_html()</dt>
+            <dd>
+              Fertige Ausgabe als String (UTF-8). CSV mit BOM und CRLF, JSON als
+              Objektarray, HTML als vollständiges Dokument.
+            </dd>
+            <dt>export_csv(path) / export_json(path) / export_html(path)</dt>
+            <dd>
+              Schreiben die Ausgabe in eine Datei. Liefern <code>bool</code>.
+            </dd>
+          </dl>
+        </section>
+
+        <section id="streaming">
+          <h2>Streaming &amp; Iteration</h2>
+          <dl>
+            <dt>stream() → DbResult&lt;RowStream&gt;</dt>
+            <dd>
+              Lazy-Iterator mit echtem Fehler pro Zeile. Ohne
+              <code>order_by</code>, <code>group_by</code>,
+              <code>distinct</code>, Joins oder Unterabfragen wird Block für
+              Block von der Platte gelesen (konstanter Speicher).
+            </dd>
+            <dt>for row in db.table("t")</dt>
+            <dd>
+              Bequeme Iteration (<code>IntoIterator</code>). Fehler werden auf
+              <code>stderr</code> gemeldet und beenden die Iteration.
+            </dd>
+          </dl>
+        </section>
+
+        <section id="mutation">
+          <h2>Mutationen über Abfragen</h2>
+          <p>
+            Filter, Sortierung, <code>skip</code> und <code>limit</code> werden
+            beachtet. Innerhalb einer <a href="#tx">Tx</a> laufen sie in dieser,
+            sonst in einer eigenen Transaktion.
+          </p>
+          <dl>
+            <dt>patch(fields) → usize</dt>
+            <dd>
+              Partielles UPDATE. Nur die angegebenen Spalten werden
+              überschrieben. Rückgabe: Anzahl geänderter Zeilen.
+            </dd>
+            <dt>merge(fields) → usize</dt>
+            <dd>Alias für <code>patch</code>.</dd>
+            <dt>delete() → usize</dt>
+            <dd>Löscht alle Treffer (inkl. <code>ON DELETE CASCADE</code>).</dd>
+            <dt>remove_field(col) → usize</dt>
+            <dd>
+              Entfernt eine Spalte aus Schema und allen Zeilen. Der
+              <code>filter</code> wird ignoriert.
+            </dd>
+            <dt>try_patch / try_delete / try_remove_field</dt>
+            <dd>dieselben Operationen mit <code>Result</code>.</dd>
+          </dl>
+          <p>
+            Auf einem <a href="#snapshot">Snapshot</a> sind alle Mutationen
+            verboten – sie liefern <code>DbError::ReadOnly</code>.
+          </p>
+        </section>
+
+        <section id="explain">
+          <h2>explain() – Ausführungsplan</h2>
+          <p>
+            Zeigt als Text, wie die Abfrage ausgeführt wird: Scan-Art, genutzte
+            Indizes, Joins, Gruppierung, Filter ohne Index, Limit.
+          </p>
+          <ul>
+            <li><code>SCAN t</code> – vollständiger Scan.</li>
+            <li>
+              <code>SEARCH t USING INDEX col=?</code> – Index wird genutzt.
+            </li>
+            <li>
+              <code>SCAN t USING INDEX col (absteigend, kein Sortieren)</code> –
+              Index liefert Sortierung mit.
+            </li>
+            <li>
+              <code>JOIN / LEFT JOIN tab (Hash-Join …)</code>,
+              <code>SUBQUERY</code>, <code>UNION</code>.
+            </li>
+            <li>
+              <code>GROUP BY [… ]</code>, <code>HAVING (n Closure(s))</code>,
+              <code>DISTINCT</code>,
+              <code>FILTER (n Closure(s), kein Index)</code>,
+              <code>LIMIT n</code>.
+            </li>
+          </ul>
+        </section>
+
+        <section id="agg">
+          <h2>Agg – Aggregatfunktion</h2>
+          <p>
+            Bausteine für <code>group_by(…).agg(&amp;[…])</code>. Jedes Aggregat
+            hat eine Ausgabespalte, deren Name sich aus Funktion und Spalte
+            ergibt oder per <code>alias</code> gesetzt wird.
+          </p>
+          <dl>
+            <dt>count()</dt>
+            <dd>Anzahl Zeilen der Gruppe (Ausgabe: <code>count</code>).</dd>
+            <dt>count_of(col)</dt>
+            <dd>
+              Anzahl nicht-leerer Werte (Ausgabe: <code>count_col</code>).
+            </dd>
+            <dt>sum(col)</dt>
+            <dd>Summe (Ausgabe: <code>sum_col</code>).</dd>
+            <dt>avg(col)</dt>
+            <dd>Durchschnitt (Ausgabe: <code>avg_col</code>).</dd>
+            <dt>min(col) / max(col)</dt>
+            <dd>
+              Kleinster / größter Wert (Ausgabe:
+              <code>min_col</code>/<code>max_col</code>).
+            </dd>
+            <dt>alias(name)</dt>
+            <dd>Setzt den Namen der Ausgabespalte.</dd>
+          </dl>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="tx">
+          <h2>Tx – Schreib-Transaktion</h2>
+          <p>
+            Eine Transaktion hält exklusiv den Schreib-Lock und arbeitet auf
+            Kopien (Copy-on-Write). Erst <code>commit()</code> schreibt neue
+            Dateien und schaltet sie mit einem atomaren Manifest-Rename scharf.
+            Drop ohne <code>commit()</code> = Rollback.
+          </p>
+
+          <h4>Erzeugen</h4>
+          <dl>
+            <dt>db.begin() → DbResult&lt;Tx&gt;</dt>
+            <dd>Startet eine Transaktion und wartet auf den Schreib-Lock.</dd>
+            <dt>db.transaction(|tx| { … }) → DbResult&lt;R&gt;</dt>
+            <dd>
+              Komfortfunktion: <code>Ok</code> → Commit, <code>Err</code> oder
+              Panic → Rollback.
+            </dd>
+          </dl>
+
+          <h4>Abschluss</h4>
+          <dl>
+            <dt>commit(self) → DbResult&lt;()&gt;</dt>
+            <dd>Macht alle Änderungen atomar und dauerhaft.</dd>
+            <dt>rollback(self)</dt>
+            <dd>Verwirft alles. Identisch zum Drop.</dd>
+          </dl>
+
+          <h4>Version</h4>
+          <dl>
+            <dt>user_version() → u32</dt>
+            <dd>Aktuelle Schema-Version (inkl. dieser Transaktion).</dd>
+            <dt>set_user_version(v) → DbResult&lt;()&gt;</dt>
+            <dd>Setzt die Versionsnummer.</dd>
+          </dl>
+
+          <h4>Tabellen &amp; Zeilen in der Transaktion</h4>
+          <p>
+            Dieselben Methoden wie auf <code>DBCore</code>, aber als
+            <code>DbResult</code>: <code>create_table</code>,
+            <code>create_table_if_missing</code>, <code>drop_table</code>,
+            <code>rename_table</code>, <code>add_field</code>,
+            <code>remove_field</code>, <code>rename_field</code>,
+            <code>create_index</code>, <code>create_unique_index</code>,
+            <code>drop_index</code>, <code>tables</code>; sowie
+            <code>add</code>, <code>put</code>, <code>update</code>,
+            <code>remove</code>, <code>put_many</code>, <code>add_many</code>,
+            <code>get</code>, <code>has</code>.
+          </p>
+
+          <h4>Abfragen in der Transaktion</h4>
+          <dl>
+            <dt>tx.table(name) → Table</dt>
+            <dd>
+              Sieht auch die eigenen, noch nicht committeten Änderungen. Damit
+              lassen sich <code>where_*</code>, <code>patch</code>,
+              <code>delete</code> usw. nutzen.
+            </dd>
+          </dl>
+
+          <div class="warn">
+            <strong>Re-Entrancy:</strong> Innerhalb von
+            <code>transaction(|tx| …)</code> immer <code>tx.…</code> verwenden –
+            ein <code>db.…</code> würde auf den eigenen Lock warten und
+            <code>Busy</code> liefern.
+          </div>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="snapshot">
+          <h2>Snapshot – fester Lese-Stand</h2>
+          <p>
+            Ein Snapshot friert den aktuellen Zustand der ganzen Datenbank ein.
+            Alle Abfragen darüber sehen exakt denselben Stand – auch über
+            mehrere Tabellen und auch dann, wenn parallel committet wird.
+          </p>
+          <dl>
+            <dt>db.snapshot() → DbResult&lt;Snapshot&gt;</dt>
+            <dd>
+              Erzeugt einen festen, gepinnten Snapshot. Er bleibt gültig, egal
+              wie viele Schreiber danach committen.
+            </dd>
+            <dt>snapshot.table(name) → Table</dt>
+            <dd>
+              Abfrage auf dem Snapshot. Mutationen sind verboten
+              (<code>DbError::ReadOnly</code>).
+            </dd>
+            <dt>tables() → Vec&lt;String&gt;</dt>
+            <dd>Alle Tabellen zum Zeitpunkt des Snapshots.</dd>
+            <dt>has_table(name) → bool</dt>
+            <dd>Gab es die Tabelle?</dd>
+            <dt>user_version() → u32</dt>
+            <dd>Schema-Version zum Snapshot-Zeitpunkt.</dd>
+          </dl>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="indizes">
+          <h2>Indizes</h2>
+          <p>
+            Ein Index liegt im Speicher pro Tabellenstand und wird beim ersten
+            Zugriff gebaut. Die Definition ist persistent. Der Planer nutzt
+            Indizes und den <code>@key</code> automatisch für
+            <code>where_eq</code>, <code>where_in</code>, Bereichsbedingungen
+            und <code>order_by … limit</code>.
+          </p>
+          <dl>
+            <dt>create_index(table, col)</dt>
+            <dd>Sekundärer (nicht eindeutiger) Index.</dd>
+            <dt>create_unique_index(table, col)</dt>
+            <dd>
+              Eindeutiger Index. Schlägt fehl, wenn schon Duplikate existieren.
+            </dd>
+            <dt>drop_index(table, col)</dt>
+            <dd>
+              Entfernt einen Index. Ist die Spalte als UNIQUE referenziert, wird
+              der Drop verweigert.
+            </dd>
+            <dt>indexes(table) → Vec&lt;String&gt;</dt>
+            <dd>
+              Alle indizierten Spalten (inkl. <code>@key</code> und
+              <code>UNIQUE</code>).
+            </dd>
+          </dl>
+        </section>
+
+        <section id="migration">
+          <h2>Schema-Änderungen</h2>
+          <p>Alle Änderungen laufen als Transaktion und sind atomar.</p>
+          <dl>
+            <dt>add_field(table, ColumnDef)</dt>
+            <dd>
+              Neue Spalte. Existieren bereits Zeilen, ist ein Default Pflicht.
+              <code>@key</code> kann nachträglich nicht gesetzt werden.
+            </dd>
+            <dt>rename_field(table, old, new)</dt>
+            <dd>Spalte umbenennen. Foreign Keys werden mitgeführt.</dd>
+            <dt>remove_field(table, col)</dt>
+            <dd>
+              Spalte entfernen. Fehler, wenn sie noch referenziert wird oder die
+              letzte Spalte ist.
+            </dd>
+            <dt>rename_table(old, new)</dt>
+            <dd>Tabelle umbenennen. Foreign Keys werden angepasst.</dd>
+          </dl>
+        </section>
+
+        <section id="migrate">
+          <h2>migrate() – versionierte Migrationen</h2>
+          <p>
+            Führt eine Liste von <code>(Version, Funktion)</code>-Schritten in
+            aufsteigender Versionsreihenfolge aus. Jeder Schritt läuft genau
+            dann, wenn die aktuelle <code>user_version</code> kleiner ist, und
+            setzt die Version im selben atomaren Schritt.
+          </p>
+          <dl>
+            <dt>Migration</dt>
+            <dd>Typ <code>(u32, fn(&amp;Tx) → DbResult&lt;()&gt;)</code>.</dd>
+            <dt>db.migrate(&amp;[Migration]) → DbResult&lt;u32&gt;</dt>
+            <dd>
+              Führt alle fälligen Schritte aus und gibt die erreichte Version
+              zurück. Mehrfaches Aufrufen ist harmlos (idempotent).
+            </dd>
+          </dl>
+        </section>
+
+        <section id="wartung">
+          <h2>Integritätsprüfung</h2>
+          <dl>
+            <dt>db.integrity_check() → Vec&lt;String&gt;</dt>
+            <dd>
+              Leerer Vektor = alles in Ordnung. Sonst enthält er pro Problem
+              eine Meldung:
+            </dd>
+          </dl>
+          <ul>
+            <li>
+              Entschlüsselung/Authentizität aller Blöcke (Manipulation,
+              Abschneiden, Umsortieren).
+            </li>
+            <li>Typkonformität aller Zellen.</li>
+            <li><code>NOT NULL</code>, <code>CHECK</code>.</li>
+            <li>Doppelte <code>UNIQUE</code>/<code>@key</code>-Werte.</li>
+            <li>Verwaiste Foreign Keys.</li>
+          </ul>
+          <p>
+            Verwaiste Dateien werden als solches nicht gemeldet, aber beim
+            nächsten Öffnen aufgeräumt.
+          </p>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="export">
+          <h2>CSV / JSON / HTML</h2>
+          <p>
+            Alle drei Formate stehen auf <code>Table</code> und – als Kurzformen
+            – auf <code>DBCore</code> bereit. Auf <code>DBCore</code> nehmen die
+            Methoden zusätzlich einen Tabellennamen.
+          </p>
+          <dl>
+            <dt>table.to_csv() → String</dt>
+            <dd>
+              CSV (UTF-8 mit BOM, CRLF-Zeilen). Zellen werden korrekt escaped
+              (<code>"</code> → <code>""</code>, Felder mit
+              <code>,</code>/<code>"</code>/Neuzeile in Anführungszeichen).
+            </dd>
+            <dt>table.to_json() → String</dt>
+            <dd>
+              JSON-Array aus Objekten. Int-/Float-/Bool-Spalten liefern echte
+              JSON-Werte, <code>NaN</code>/<code>inf</code> werden als Strings
+              ausgegeben.
+            </dd>
+            <dt>table.to_html() → String</dt>
+            <dd>
+              Vollständiges HTML-Dokument mit eingebettetem Stylesheet. Zellen
+              werden escaped.
+            </dd>
+            <dt>export_csv / export_json / export_html (path)</dt>
+            <dd>
+              Schreiben das jeweilige Format in eine Datei. Liefern
+              <code>bool</code>.
+            </dd>
+          </dl>
+          <p>
+            Auf <code>DBCore</code>: <code>to_csv(table)</code>,
+            <code>export_csv(table, path)</code> und entsprechend für JSON und
+            HTML.
+          </p>
+        </section>
+
+        <section id="web">
+          <h2>Web-Interface</h2>
+          <dl>
+            <dt>open_interface(port: u16)</dt>
+            <dd>
+              Startet einen blockierenden HTTP-Server auf
+              <code>127.0.0.1:&lt;port&gt;</code>. Bietet Übersicht,
+              Tabellenansicht mit Suche, Sortierung, Paginierung,
+              Neu/Edit/Löschen/Upsert-Formulare und Export als CSV/JSON/HTML.
+            </dd>
+          </dl>
+          <p>
+            Sicherheit: nur Loopback-Adresse, Prüfung von
+            <code>Host</code>-Header (gegen DNS-Rebinding) und
+            <code>Origin</code> bei POST (gegen CSRF). Zeilen werden über Index
+            plus Fingerabdruck adressiert, damit gleichzeitige Schreiber sich
+            nicht überschreiben.
+          </p>
+        </section>
+
+        <!-- ═══════════════════════════════════════════════════════════════ -->
+        <section id="fehler">
+          <h2>DbError – Fehlertypen</h2>
+          <p>
+            Alle <code>try_*</code>-Methoden liefern
+            <code>DbResult&lt;T&gt; = Result&lt;T, DbError&gt;</code>. Die
+            Kurzformen ohne <code>try_</code> melden den Fehler auf
+            <code>stderr</code> und liefern einen neutralen Wert.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Variante</th>
+                <th>Bedeutung</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>Io</code></td>
+                <td>Dateisystem-Fehler.</td>
+              </tr>
+              <tr>
+                <td><code>Crypto</code></td>
+                <td>
+                  Authentifizierung/Entschlüsselung fehlgeschlagen
+                  (Manipulation, falscher Schlüssel).
+                </td>
+              </tr>
+              <tr>
+                <td><code>Corrupt</code></td>
+                <td>Beschädigte Struktur.</td>
+              </tr>
+              <tr>
+                <td><code>InvalidName</code></td>
+                <td>
+                  Name enthält unerlaubte Zeichen (erlaubt:
+                  <code>a-z A-Z 0-9 _ -</code>).
+                </td>
+              </tr>
+              <tr>
+                <td><code>TableExists</code></td>
+                <td>Tabelle existiert bereits.</td>
+              </tr>
+              <tr>
+                <td><code>TableNotFound</code></td>
+                <td>Tabelle fehlt.</td>
+              </tr>
+              <tr>
+                <td><code>RowNotFound</code></td>
+                <td>Zeile fehlt (z.&nbsp;B. per Key oder Index).</td>
+              </tr>
+              <tr>
+                <td><code>Closed</code></td>
+                <td>Datenbank ist nicht geöffnet.</td>
+              </tr>
+              <tr>
+                <td><code>SchemaMismatch</code></td>
+                <td>
+                  Spalte unbekannt, mehrdeutig, Pflichtfeld fehlt, mehrere
+                  <code>@key</code> …
+                </td>
+              </tr>
+              <tr>
+                <td><code>TypeMismatch</code></td>
+                <td>Wert passt nicht zum Spaltentyp.</td>
+              </tr>
+              <tr>
+                <td><code>DuplicateKey</code></td>
+                <td>Doppelter <code>@key</code>-Wert.</td>
+              </tr>
+              <tr>
+                <td><code>BadValue</code></td>
+                <td>
+                  Default enthält unerlaubte Zeichen (<code>:</code>,
+                  <code>,</code>, Zeilenumbruch).
+                </td>
+              </tr>
+              <tr>
+                <td><code>Busy</code></td>
+                <td>
+                  Schreib-Lock-Timeout – anderer Schreiber zu lange aktiv.
+                </td>
+              </tr>
+              <tr>
+                <td><code>NotNull</code></td>
+                <td>NOT-NULL-Verletzung.</td>
+              </tr>
+              <tr>
+                <td><code>Unique</code></td>
+                <td>UNIQUE-Verletzung.</td>
+              </tr>
+              <tr>
+                <td><code>CheckFailed</code></td>
+                <td>CHECK-Verletzung.</td>
+              </tr>
+              <tr>
+                <td><code>ForeignKey</code></td>
+                <td>
+                  Fremdschlüssel-Verletzung (Referenz fehlt oder RESTRICT
+                  greift).
+                </td>
+              </tr>
+              <tr>
+                <td><code>ReadOnly</code></td>
+                <td>Schreiben auf Snapshot oder beendeter Transaktion.</td>
+              </tr>
+              <tr>
+                <td><code>SnapshotExpired</code></td>
+                <td>Snapshot ist veraltet – neuen holen.</td>
+              </tr>
+              <tr>
+                <td><code>TxState</code></td>
+                <td>
+                  Transaktionszustand ungültig (verschachtelt, beendet, extern
+                  verändert).
+                </td>
+              </tr>
+              <tr>
+                <td><code>Unsupported</code></td>
+                <td>Funktion für diese Abfrageform nicht verfügbar.</td>
+              </tr>
+            </tbody>
+          </table>
+          <p>
+            <code>DbError</code> implementiert <code>Display</code>,
+            <code>Error</code> und <code>From&lt;io::Error&gt;</code>.
+          </p>
+        </section>
+
+        <section id="weitere-makros">
+          <h2>Weitere Makros</h2>
+
+          <h3>with! – Filter-Closure mit Row-Zugriff</h3>
+          <p>
+            Erzeugt eine Closure, in der man eine <code>Row</code> mit
+            Positions-, Namens- und typisiertem Zugriff hat.
+          </p>
+          <pre><code>with!(r =&gt; r["name"] == "Alice")
+with!(r =&gt; r.get::&lt;i64&gt;("views").unwrap_or(0) &gt; 0)</code></pre>
+          <p>
+            Wird als Argument an <code>filter</code> und
+            <code>having</code> gegeben.
+          </p>
+
+          <h3>remove_if! – Bedingtes Löschen</h3>
+          <p>
+            Kurzform für <code>db.table(t).filter(with!(…)).delete()</code>.
+            Liefert die Anzahl gelöschter Zeilen.
+          </p>
+          <pre><code>remove_if!(db, "users", r =&gt; r[1].starts_with('A'))</code></pre>
+        </section>
+
+        <section id="konstanten">
+          <h2>Konstanten, Traits und Typen</h2>
+
+          <h4>Konstanten</h4>
+          <dl>
+            <dt>BASE_DIR</dt>
+            <dd>
+              Verzeichnisname für benannte Datenbanken
+              (<code>"dbcore_data"</code>).
+            </dd>
+          </dl>
+
+          <h4>Traits</h4>
+          <dl>
+            <dt>ColumnType</dt>
+            <dd>
+              Bindet Rust-Typen an einen <code>ColumnKind</code>. Wird von
+              <code>schema!</code> genutzt.
+            </dd>
+            <dt>FromCell</dt>
+            <dd>Zelle → Rust-Wert. Für Standardtypen implementiert.</dd>
+            <dt>FromRow</dt>
+            <dd>Row → eigener Typ.</dd>
+            <dt>Model: FromRow</dt>
+            <dd>
+              Zusätzlich Schema und Serialisierung (siehe
+              <a href="#model-makro">model!</a>).
+            </dd>
+          </dl>
+
+          <h4>Typen</h4>
+          <dl>
+            <dt>DbResult&lt;T&gt;</dt>
+            <dd>Alias für <code>Result&lt;T, DbError&gt;</code>.</dd>
+            <dt>Migration</dt>
+            <dd><code>(u32, fn(&amp;Tx) → DbResult&lt;()&gt;)</code>.</dd>
+            <dt>Order</dt>
+            <dd><code>Asc</code> oder <code>Desc</code>.</dd>
+            <dt>CmpOp</dt>
+            <dd>
+              <code>Eq</code>, <code>Ne</code>, <code>Lt</code>,
+              <code>Le</code>, <code>Gt</code>, <code>Ge</code>.
+            </dd>
+            <dt>RowStream</dt>
+            <dd>
+              Lazy-Iterator über Ergebniszeilen mit
+              <code>DbResult&lt;Vec&lt;String&gt;&gt;</code> pro Schritt.
+            </dd>
+            <dt>Rows</dt>
+            <dd>Vereinfachter Iterator für <code>for row in table</code>.</dd>
+            <dt>Schema</dt>
+            <dd>Sammlung von <code>ColumnDef</code> plus Builder-Methoden.</dd>
+            <dt>ColumnDef</dt>
+            <dd>Eine Spaltendefinition.</dd>
+            <dt>ForeignKey</dt>
+            <dd>
+              <code>table</code>, <code>column</code>, <code>on_delete</code>.
+            </dd>
+            <dt>Snapshot</dt>
+            <dd>Fester Lese-Stand.</dd>
+            <dt>Tx</dt>
+            <dd>Schreib-Transaktion.</dd>
+            <dt>Table</dt>
+            <dd>Query-Builder.</dd>
+            <dt>Agg</dt>
+            <dd>Aggregat für Gruppierung.</dd>
+          </dl>
+        </section>
+
+        <footer>
+          Ende der Funktionsreferenz. Alle hier beschriebenen Typen, Methoden
+          und Makros sind Teil der öffentlichen API der Bibliothek.
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,995 @@
+//! Speicherschicht.
+//!
+//! * **Tabellendatei (v3)**: `DBC3 | prefix(20) | { len:u32 | AEAD-Block }*`.
+//!   Block 0 = Kopf (Schema/Constraints), danach Zeilenblöcke. Nonce =
+//!   `prefix ‖ Blocknummer`, AAD enthält Tabellenname und „letzter Block“-Flag
+//!   (Schutz gegen Umsortieren, Abschneiden, Anhängen, Vertauschen von Tabellen).
+//! * **Unveränderlich**: `name.<seq>.tbl` wird nie überschrieben.
+//! * **Manifest**: verschlüsselte Liste `Tabelle → Datei`. Der atomare
+//!   `rename` des Manifests ist der Commit-Punkt.
+//! * **Locks**: Leser brauchen keine; Schreiber serialisieren sich über ein
+//!   In-Prozess-Flag und ein OS-Datei-Lock (`.writer.lock`).
+
+use super::*;
+use chacha20poly1305::aead::{rand_core::RngCore, Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
+use std::sync::Mutex;
+use std::time::Instant;
+
+const KEY_LEN: usize = 32;
+const LEGACY_NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+const MAGIC_TABLE: &[u8; 4] = b"DBC3";
+const MAGIC_MANIFEST: &[u8; 4] = b"DBM1";
+const X_NONCE_LEN: usize = 24;
+const PREFIX_LEN: usize = 20;
+const ROWS_PER_CHUNK: usize = 1024;
+const CHUNK_BYTES: usize = 256 * 1024;
+const MAX_CHUNK: usize = 256 * 1024 * 1024;
+const MANIFEST: &str = "MANIFEST";
+
+// ───────────── Index (im Speicher) ─────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum IKey { Int(i128), Float(u64), Text(String) }
+
+impl IKey {
+    pub(crate) fn of(kind: ColumnKind, v: &str) -> IKey {
+        match kind {
+            ColumnKind::Int => v.parse::<i128>().map(IKey::Int)
+                .unwrap_or_else(|_| IKey::Text(v.to_string())),
+            ColumnKind::Float => match v.parse::<f64>() {
+                Ok(f) if f.is_finite() => {
+                    let b = f.to_bits();
+                    IKey::Float(if b >> 63 == 1 { !b } else { b | (1 << 63) })
+                }
+                _ => IKey::Text(v.to_string()),
+            },
+            _ => IKey::Text(v.to_string()),
+        }
+    }
+}
+
+pub(crate) struct BIndex {
+    map: BTreeMap<IKey, Vec<usize>>,
+    kind: ColumnKind,
+}
+
+impl BIndex {
+    fn build(kind: ColumnKind, rows: &[Vec<String>], ci: usize) -> Self {
+        let mut map: BTreeMap<IKey, Vec<usize>> = BTreeMap::new();
+        for (p, r) in rows.iter().enumerate() {
+            map.entry(IKey::of(kind, cell(r, ci))).or_default().push(p);
+        }
+        BIndex { map, kind }
+    }
+    pub(crate) fn get(&self, v: &str) -> &[usize] {
+        self.map.get(&IKey::of(self.kind, v)).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+    /// Positionen im Bereich (aufsteigend nach Position sortiert).
+    pub(crate) fn range(&self, lo: Option<(&str, bool)>, hi: Option<(&str, bool)>) -> Vec<usize> {
+        let conv = |b: Option<(&str, bool)>| match b {
+            None => Bound::Unbounded,
+            Some((v, incl)) => {
+                let k = IKey::of(self.kind, v);
+                if incl { Bound::Included(k) } else { Bound::Excluded(k) }
+            }
+        };
+        let (l, h) = (conv(lo), conv(hi));
+        // BTreeMap::range paniken bei start > end – vorher prüfen.
+        let empty = match (&l, &h) {
+            (Bound::Included(a), Bound::Included(b)) => a > b,
+            (Bound::Included(a), Bound::Excluded(b))
+            | (Bound::Excluded(a), Bound::Included(b)) => a >= b,
+            (Bound::Excluded(a), Bound::Excluded(b)) => a >= b,
+            _ => false,
+        };
+        if empty { return Vec::new(); }
+        let mut out: Vec<usize> = self.map.range((l, h)).flat_map(|(_, v)| v.iter().copied()).collect();
+        out.sort_unstable();
+        out
+    }
+    pub(crate) fn ordered(&self, desc: bool) -> Box<dyn Iterator<Item = &Vec<usize>> + '_> {
+        if desc { Box::new(self.map.values().rev()) } else { Box::new(self.map.values()) }
+    }
+}
+
+// ───────────── Tabellendaten ─────────────
+
+pub(crate) struct TableData {
+    pub(crate) name: String,
+    pub(crate) schema: Vec<ColDef>,
+    pub(crate) rows: Vec<Vec<String>>,
+    idx: Mutex<HashMap<usize, Arc<BIndex>>>,
+}
+
+impl Clone for TableData {
+    fn clone(&self) -> Self {
+        TableData {
+            name: self.name.clone(), schema: self.schema.clone(),
+            rows: self.rows.clone(), idx: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl TableData {
+    pub(crate) fn new(name: String, schema: Vec<ColDef>, rows: Vec<Vec<String>>) -> Self {
+        TableData { name, schema, rows, idx: Mutex::new(HashMap::new()) }
+    }
+    pub(crate) fn col(&self, name: &str) -> Option<usize> { self.schema.iter().position(|c| c.name == name) }
+    pub(crate) fn is_indexed(&self, ci: usize) -> bool { self.schema[ci].is_indexed() }
+    /// Index lazy bauen (pro Tabellenstand einmal) und gemeinsam nutzen.
+    pub(crate) fn index(&self, ci: usize) -> Arc<BIndex> {
+        let mut g = self.idx.lock().unwrap_or_else(|p| p.into_inner());
+        g.entry(ci).or_insert_with(|| Arc::new(BIndex::build(self.schema[ci].kind, &self.rows, ci))).clone()
+    }
+    /// Vor jeder Änderung aufrufen: verwirft die gebauten Indizes.
+    pub(crate) fn touch(&mut self) {
+        self.idx.get_mut().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+}
+
+// ───────────── Manifest ─────────────
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Manifest {
+    pub(crate) seq: u64,
+    pub(crate) user_version: u32,
+    pub(crate) tables: BTreeMap<String, String>,
+}
+
+fn valid_filename(f: &str) -> bool {
+    !f.is_empty() && f.len() <= 200 && !f.starts_with('.') && !f.contains("..")
+        && f.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+impl Manifest {
+    fn encode(&self) -> String {
+        let mut s = format!("MANIFEST:1\nSEQ:{}\nVERSION:{}\n", self.seq, self.user_version);
+        for (n, f) in &self.tables { s.push_str(&format!("T:{n}:{f}\n")); }
+        s
+    }
+    fn decode(text: &str) -> Result<Manifest> {
+        let mut m = Manifest::default();
+        let mut saw_head = false;
+        for line in text.lines() {
+            if line == "MANIFEST:1" { saw_head = true; }
+            else if let Some(v) = line.strip_prefix("SEQ:") {
+                m.seq = v.parse().map_err(|_| DbError::Corrupt("Manifest: SEQ"))?;
+            } else if let Some(v) = line.strip_prefix("VERSION:") {
+                m.user_version = v.parse().map_err(|_| DbError::Corrupt("Manifest: VERSION"))?;
+            } else if let Some(v) = line.strip_prefix("T:") {
+                let (n, f) = v.split_once(':').ok_or(DbError::Corrupt("Manifest: Eintrag"))?;
+                if !valid_name(n) || !valid_filename(f) { return Err(DbError::Corrupt("Manifest: Name")); }
+                m.tables.insert(n.to_string(), f.to_string());
+            }
+        }
+        if !saw_head { return Err(DbError::Corrupt("Manifest: Kopf fehlt")); }
+        Ok(m)
+    }
+}
+
+// ───────────── Kopf-Text (Schema + Constraints) ─────────────
+
+fn esc_field(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"), ':' => o.push_str("\\:"),
+            '\n' => o.push_str("\\n"), '\r' => o.push_str("\\r"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn split_fields(s: &str) -> Vec<String> {
+    let (mut out, mut cur) = (Vec::new(), String::new());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => match it.next() {
+                Some('n') => cur.push('\n'), Some('r') => cur.push('\r'),
+                Some(o) => cur.push(o), None => cur.push('\\'),
+            },
+            ':' => out.push(std::mem::take(&mut cur)),
+            c => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Spaltenzeile `COLS:` (Format unverändert zu v1/v2).
+fn schema_line(cols: &[ColDef]) -> String {
+    let mut out = String::new();
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push_str(&c.name);
+        out.push(':');
+        out.push_str(c.kind.as_str());
+        out.push(':');
+        out.push(if c.key { 'k' } else { '-' });
+        if let Some(d) = &c.default { out.push(':'); out.push_str(d); }
+    }
+    out
+}
+
+pub(crate) fn header_text(name: &str, cols: &[ColDef]) -> String {
+    let mut h = format!("TABLE:{name}\nCOLS:{}\nFORMAT:3\n", schema_line(cols));
+    for c in cols {
+        if c.not_null { h.push_str(&format!("NN:{}\n", esc_field(&c.name))); }
+        if c.unique && !c.key { h.push_str(&format!("UQ:{}\n", esc_field(&c.name))); }
+        if c.indexed && !c.unique && !c.key { h.push_str(&format!("IX:{}\n", esc_field(&c.name))); }
+        for ck in &c.checks {
+            let toks: Vec<String> = ck.encode().iter().map(|t| esc_field(t)).collect();
+            h.push_str(&format!("CK:{}:{}\n", esc_field(&c.name), toks.join(":")));
+        }
+        if let Some(fk) = &c.fk {
+            h.push_str(&format!("FK:{}:{}:{}:{}\n", esc_field(&c.name), esc_field(&fk.table),
+                esc_field(&fk.column), if fk.on_delete == OnDelete::Cascade { "cascade" } else { "restrict" }));
+        }
+    }
+    h
+}
+
+pub(crate) fn parse_header(text: &str, name: &str) -> Result<Vec<ColDef>> {
+    let cols_line = text.lines().find(|l| l.starts_with("COLS:")).ok_or(DbError::Corrupt("Schema fehlt"))?;
+    if let Some(t) = text.lines().find(|l| l.starts_with("TABLE:")) {
+        if &t[6..] != name { return Err(DbError::Corrupt("Tabellenname passt nicht zur Datei")); }
+    }
+    let body = &cols_line[5..];
+    let mut cols = Vec::new();
+    if !body.is_empty() {
+        for s in body.split(',') {
+            let mut parts = s.splitn(4, ':');
+            let n = parts.next().unwrap_or("").to_string();
+            let kind = ColumnKind::from_str(parts.next().unwrap_or("Text"));
+            let key = parts.next().unwrap_or("-") == "k";
+            let default = parts.next().map(|s| s.to_string());
+            cols.push(ColumnDef::new(n, kind, default, key));
+        }
+    }
+    for line in text.lines() {
+        let Some((tag, rest)) = line.split_once(':') else { continue };
+        if !matches!(tag, "NN" | "UQ" | "IX" | "CK" | "FK") { continue; }
+        let f = split_fields(rest);
+        let Some(ci) = f.first().and_then(|n| cols.iter().position(|c| &c.name == n)) else { continue };
+        match tag {
+            "NN" => cols[ci].not_null = true,
+            "UQ" => cols[ci].unique = true,
+            "IX" => cols[ci].indexed = true,
+            "CK" => { if let Some(c) = Check::decode(&f[1..]) { cols[ci].checks.push(c); } }
+            "FK" if f.len() >= 4 => cols[ci].fk = Some(ForeignKey {
+                table: f[1].clone(), column: f[2].clone(),
+                on_delete: if f[3] == "cascade" { OnDelete::Cascade } else { OnDelete::Restrict },
+            }),
+            _ => {}
+        }
+    }
+    Ok(cols)
+}
+
+// ───────────── Store ─────────────
+
+pub(crate) struct Store {
+    pub(crate) dir: PathBuf,
+    x: XChaCha20Poly1305,
+    legacy: ChaCha20Poly1305,
+    cache: Mutex<HashMap<String, (String, Arc<TableData>)>>,
+    metas: Mutex<HashMap<String, Arc<Vec<ColDef>>>>,
+    cache_on: AtomicBool,
+    sync: AtomicBool,
+    busy_ms: AtomicU64,
+    writer_busy: AtomicBool,
+    temp: bool,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) { if self.temp { let _ = fs::remove_dir_all(&self.dir); } }
+}
+
+pub(crate) struct WriterGuard { store: Arc<Store>, file: File }
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+        self.store.writer_busy.store(false, AO::Release);
+    }
+}
+
+fn load_or_create_key(dir: &Path) -> Result<Key> {
+    let path = dir.join(".key");
+    let read_existing = |bytes: Vec<u8>| -> Result<Key> {
+        if bytes.len() == KEY_LEN { Ok(*Key::from_slice(&bytes)) }
+        else { Err(DbError::Corrupt("Schlüsseldatei beschädigt")) }
+    };
+    match fs::read(&path) {
+        Ok(bytes) => read_existing(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let key = ChaCha20Poly1305::generate_key(&mut OsRng);
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut f) => { f.write_all(&key)?; f.sync_all()?; Ok(key) }
+                // Anderer Prozess war schneller → dessen Schlüssel verwenden.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // Der Gewinner schreibt evtl. noch – kurz warten.
+                    for _ in 0..50 {
+                        let b = fs::read(&path)?;
+                        if b.len() == KEY_LEN { return read_existing(b); }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    read_existing(fs::read(&path)?)
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn chunk_aad(name: &str, last: bool) -> Vec<u8> {
+    let mut a = Vec::with_capacity(name.len() + 8);
+    a.extend_from_slice(b"DBC3\0");
+    a.extend_from_slice(name.as_bytes());
+    a.push(0);
+    a.push(last as u8);
+    a
+}
+
+fn chunk_nonce(prefix: &[u8; PREFIX_LEN], idx: u32) -> [u8; X_NONCE_LEN] {
+    let mut n = [0u8; X_NONCE_LEN];
+    n[..PREFIX_LEN].copy_from_slice(prefix);
+    n[PREFIX_LEN..].copy_from_slice(&idx.to_be_bytes());
+    n
+}
+
+/// Windows meldet kurzzeitige Sperren (Datei wird gerade ersetzt/gelöscht, Virenscanner, …)
+/// als „Zugriff verweigert“ (5) bzw. „Sharing-/Lock-Verletzung“ (32/33).
+fn transient(e: &io::Error) -> bool {
+    cfg!(windows) && (e.kind() == io::ErrorKind::PermissionDenied
+        || matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33)))
+}
+
+/// Datei ist weg *oder* (Windows) im „Löschen ausstehend“-Zustand → Leser nehmen den neuen Stand.
+pub(crate) fn vanished(e: &io::Error) -> bool { e.kind() == io::ErrorKind::NotFound || transient(e) }
+
+/// Wiederholt eine I/O-Operation bei kurzzeitigen Windows-Sperren (bis ca. 3 s).
+fn retry_io<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut i = 0u64;
+    loop {
+        match f() {
+            Err(e) if transient(&e) && i < 150 => {
+                std::thread::sleep(Duration::from_millis((1 + i).min(20)));
+                i += 1;
+            }
+            r => return r,
+        }
+    }
+}
+
+pub(crate) fn is_not_found(e: &DbError) -> bool {
+    matches!(e, DbError::Io(io) if vanished(io))
+}
+
+impl Store {
+    pub(crate) fn open(dir: PathBuf, temp: bool) -> Result<Arc<Store>> {
+        fs::create_dir_all(&dir)?;
+        let key = load_or_create_key(&dir)?;
+        let store = Arc::new(Store {
+            dir,
+            x: XChaCha20Poly1305::new(&key),
+            legacy: ChaCha20Poly1305::new(&key),
+            cache: Mutex::new(HashMap::new()),
+            metas: Mutex::new(HashMap::new()),
+            cache_on: AtomicBool::new(true),
+            sync: AtomicBool::new(true),
+            busy_ms: AtomicU64::new(10_000),
+            writer_busy: AtomicBool::new(false),
+            temp,
+        });
+        store.maintain();
+        Ok(store)
+    }
+
+    pub(crate) fn set_busy_timeout(&self, d: Duration) { self.busy_ms.store(d.as_millis() as u64, AO::Relaxed); }
+    pub(crate) fn set_sync(&self, on: bool) { self.sync.store(on, AO::Relaxed); }
+    pub(crate) fn set_cache(&self, on: bool) {
+        self.cache_on.store(on, AO::Relaxed);
+        if !on { self.clear_cache(); }
+    }
+    pub(crate) fn clear_cache(&self) {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.metas.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+    fn do_sync(&self) -> bool { self.sync.load(AO::Relaxed) }
+    pub(crate) fn path(&self, fname: &str) -> PathBuf { self.dir.join(fname) }
+
+    // ───── Locks ─────
+
+    pub(crate) fn acquire_writer(self: &Arc<Self>) -> Result<WriterGuard> {
+        self.acquire_writer_for(Duration::from_millis(self.busy_ms.load(AO::Relaxed)))
+    }
+
+    fn acquire_writer_for(self: &Arc<Self>, timeout: Duration) -> Result<WriterGuard> {
+        let deadline = Instant::now() + timeout;
+        let mut nap = Duration::from_micros(200);
+        let step = |nap: &mut Duration| {
+            std::thread::sleep(*nap);
+            *nap = (*nap * 2).min(Duration::from_millis(20));
+        };
+        // 1) In-Prozess: nur ein Schreiber-Thread zur Zeit.
+        while self.writer_busy.compare_exchange(false, true, AO::Acquire, AO::Relaxed).is_err() {
+            if Instant::now() >= deadline { return Err(DbError::Busy); }
+            step(&mut nap);
+        }
+        // 2) Zwischen Prozessen: OS-Datei-Lock (wird bei Absturz automatisch frei).
+        let file = match OpenOptions::new().read(true).write(true).create(true)
+            .open(self.dir.join(".writer.lock")) {
+            Ok(f) => f,
+            Err(e) => { self.writer_busy.store(false, AO::Release); return Err(e.into()); }
+        };
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(WriterGuard { store: Arc::clone(self), file }),
+                Err(e) => {
+                    let contended = e.kind() == io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+                    if !contended {
+                        self.writer_busy.store(false, AO::Release);
+                        return Err(e.into());
+                    }
+                    if Instant::now() >= deadline {
+                        self.writer_busy.store(false, AO::Release);
+                        return Err(DbError::Busy);
+                    }
+                    step(&mut nap);
+                }
+            }
+        }
+    }
+
+    // ───── Wartung beim Öffnen ─────
+
+    fn maintain(self: &Arc<Self>) {
+        let Ok(guard) = self.acquire_writer_for(Duration::from_secs(2)) else { return };
+        if let Err(e) = self.maintain_locked() { eprintln!("DBCore: {e}"); }
+        drop(guard);
+    }
+
+    /// Unter Schreib-Lock: alte `*.db`-Dateien übernehmen, Crash-Reste löschen.
+    fn maintain_locked(&self) -> Result<()> {
+        let mpath = self.dir.join(MANIFEST);
+        let mut m = self.read_manifest()?;
+        if !mpath.exists() {
+            let mut adopted = false;
+            for e in fs::read_dir(&self.dir)?.flatten() {
+                let fname = e.file_name().to_string_lossy().to_string();
+                if let Some(stem) = fname.strip_suffix(".db") {
+                    if valid_name(stem) && e.path().is_file() {
+                        m.tables.insert(stem.to_string(), fname.clone());
+                        adopted = true;
+                    }
+                }
+            }
+            if adopted { m.seq = 1; self.write_manifest(&m)?; }
+        }
+        let referenced: BTreeSet<&String> = m.tables.values().collect();
+        for e in fs::read_dir(&self.dir)?.flatten() {
+            let fname = e.file_name().to_string_lossy().to_string();
+            if fname.ends_with(".tmp") || (fname.ends_with(".tbl") && !referenced.contains(&fname)) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+        Ok(())
+    }
+
+    // ───── Manifest ─────
+
+    pub(crate) fn read_manifest(&self) -> Result<Manifest> {
+        let raw = match retry_io(|| fs::read(self.dir.join(MANIFEST))) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Manifest::default()),
+            Err(e) => return Err(e.into()),
+        };
+        if raw.len() < 4 + X_NONCE_LEN + TAG_LEN || &raw[..4] != MAGIC_MANIFEST {
+            return Err(DbError::Corrupt("Manifest beschädigt"));
+        }
+        let (nonce, ct) = raw[4..].split_at(X_NONCE_LEN);
+        let plain = self.x.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: b"DBC3-MANIFEST" })
+            .map_err(|_| DbError::Crypto("Manifest: Entschlüsselung fehlgeschlagen"))?;
+        let text = String::from_utf8(plain).map_err(|_| DbError::Corrupt("Manifest: UTF-8"))?;
+        Manifest::decode(&text)
+    }
+
+    pub(crate) fn write_manifest(&self, m: &Manifest) -> Result<()> {
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ct = self.x.encrypt(&nonce, Payload { msg: m.encode().as_bytes(), aad: b"DBC3-MANIFEST" })
+            .map_err(|_| DbError::Crypto("Manifest: Verschlüsselung fehlgeschlagen"))?;
+        let tmp = self.dir.join("MANIFEST.tmp");
+        {
+            let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+            f.write_all(MAGIC_MANIFEST)?;
+            f.write_all(&nonce)?;
+            f.write_all(&ct)?;
+            if self.do_sync() { f.sync_all()?; }
+        }
+        retry_io(|| fs::rename(&tmp, self.dir.join(MANIFEST)))?;
+        self.sync_dir();
+        Ok(())
+    }
+
+    pub(crate) fn sync_dir(&self) {
+        if self.do_sync() {
+            if let Ok(f) = File::open(&self.dir) { let _ = f.sync_all(); }
+        }
+    }
+
+    // ───── Tabellendatei schreiben ─────
+
+    /// Schreibt eine neue, unveränderliche Tabellendatei und liefert ihren Namen.
+    pub(crate) fn write_table_file(
+        &self, name: &str, schema: &[ColDef], rows: &[Vec<String>], seq: u64,
+    ) -> Result<String> {
+        let fname = format!("{name}.{seq:016x}.tbl");
+        let path = self.dir.join(&fname);
+        let mut prefix = [0u8; PREFIX_LEN];
+        OsRng.fill_bytes(&mut prefix);
+        let f = OpenOptions::new().write(true).create(true).truncate(true).open(&path)?;
+        let mut w = BufWriter::with_capacity(128 * 1024, f);
+        w.write_all(MAGIC_TABLE)?;
+        w.write_all(&prefix)?;
+        let mut cw = ChunkWriter { x: &self.x, w: &mut w, name, prefix, idx: 0, pending: None };
+        cw.push(header_text(name, schema).into_bytes())?;
+        let mut buf = String::new();
+        let mut n = 0usize;
+        for r in rows {
+            buf.push_str("ROW:");
+            for (i, v) in r.iter().enumerate() {
+                if i > 0 { buf.push(';'); }
+                escape_cell(v, &mut buf);
+            }
+            buf.push('\n');
+            n += 1;
+            if n >= ROWS_PER_CHUNK || buf.len() >= CHUNK_BYTES {
+                cw.push(std::mem::take(&mut buf).into_bytes())?;
+                n = 0;
+            }
+        }
+        if n > 0 { cw.push(buf.into_bytes())?; }
+        cw.finish()?;
+        w.flush()?;
+        let f = w.into_inner().map_err(|e| DbError::Io(e.into_error()))?;
+        if self.do_sync() { f.sync_all()?; }
+        Ok(fname)
+    }
+
+    // ───── Tabellendatei lesen ─────
+
+    fn read_legacy_bytes(&self, raw: &[u8], name: &str) -> Result<TableData> {
+        if raw.len() < LEGACY_NONCE_LEN + TAG_LEN { return Err(DbError::Corrupt("Datei zu kurz")); }
+        let (nonce, ct) = raw.split_at(LEGACY_NONCE_LEN);
+        let plain = self.legacy.decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: name.as_bytes() })
+            .map_err(|_| DbError::Crypto("Entschlüsselung fehlgeschlagen"))?;
+        let text = String::from_utf8(plain).map_err(|_| DbError::Corrupt("kein gültiges UTF-8"))?;
+        let schema = parse_header(&text, name)?;
+        let (_h, mut rows) = split_rows(&text);
+        for r in rows.iter_mut() { r.resize(schema.len(), String::new()); }
+        Ok(TableData::new(name.to_string(), schema, rows))
+    }
+
+    fn open_chunks(self: &Arc<Self>, br: &mut BufReader<File>, name: &str) -> Result<ChunkReader> {
+        let mut magic = [0u8; 4];
+        br.read_exact(&mut magic).map_err(|_| DbError::Corrupt("Datei zu kurz"))?;
+        if &magic != MAGIC_TABLE { return Err(DbError::Corrupt("falsche Kennung")); }
+        let mut prefix = [0u8; PREFIX_LEN];
+        br.read_exact(&mut prefix).map_err(|_| DbError::Corrupt("Datei zu kurz"))?;
+        Ok(ChunkReader { store: Arc::clone(self), name: name.to_string(), prefix, idx: 0, done: false })
+    }
+
+    fn read_v3(self: &Arc<Self>, file: File, name: &str) -> Result<TableData> {
+        let mut br = BufReader::with_capacity(128 * 1024, file);
+        let mut cr = self.open_chunks(&mut br, name)?;
+        let head = cr.next(&mut br)?.ok_or(DbError::Corrupt("Kopf fehlt"))?;
+        let schema = parse_header(&String::from_utf8(head).map_err(|_| DbError::Corrupt("UTF-8"))?, name)?;
+        let mut rows = Vec::new();
+        while let Some(chunk) = cr.next(&mut br)? {
+            parse_rows_chunk(&chunk, schema.len(), &mut rows)?;
+        }
+        Ok(TableData::new(name.to_string(), schema, rows))
+    }
+
+    /// Liest und prüft eine komplette Tabellendatei (v3, Fallback v1/v2).
+    pub(crate) fn read_file(self: &Arc<Self>, fname: &str, name: &str) -> Result<TableData> {
+        self.read_handle(File::open(self.dir.join(fname))?, name)
+    }
+
+    /// Wie `read_file`, aber von einem bereits offenen Handle (liest ab Dateianfang).
+    pub(crate) fn read_handle(self: &Arc<Self>, mut f: File, name: &str) -> Result<TableData> {
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 4];
+        let is_v3 = f.read_exact(&mut magic).is_ok() && &magic == MAGIC_TABLE;
+        f.seek(SeekFrom::Start(0))?;
+        if is_v3 {
+            let dup = f.try_clone()?;
+            match self.read_v3(dup, name) {
+                Ok(d) => return Ok(d),
+                Err(e) => {
+                    f.seek(SeekFrom::Start(0))?;
+                    let mut raw = Vec::new();
+                    f.read_to_end(&mut raw)?;
+                    return self.read_legacy_bytes(&raw, name).map_err(|_| e);
+                }
+            }
+        }
+        let mut raw = Vec::new();
+        f.read_to_end(&mut raw)?;
+        self.read_legacy_bytes(&raw, name)
+    }
+
+    /// Nur das Schema (erster Block) – für Foreign-Key-Auflösung.
+    pub(crate) fn schema_of(self: &Arc<Self>, name: &str, fname: &str) -> Result<Arc<Vec<ColDef>>> {
+        if let Some((f, d)) = self.cache.lock().unwrap_or_else(|p| p.into_inner()).get(name) {
+            if f == fname { return Ok(Arc::new(d.schema.clone())); }
+        }
+        if let Some(m) = self.metas.lock().unwrap_or_else(|p| p.into_inner()).get(fname) { return Ok(m.clone()); }
+        let path = self.dir.join(fname);
+        let mut magic = [0u8; 4];
+        let is_v3 = { let mut f = File::open(&path)?; f.read_exact(&mut magic).is_ok() && &magic == MAGIC_TABLE };
+        let schema = if is_v3 {
+            let mut br = BufReader::new(File::open(&path)?);
+            let mut cr = self.open_chunks(&mut br, name)?;
+            let head = cr.next_no_last_check(&mut br)?;
+            parse_header(&String::from_utf8(head).map_err(|_| DbError::Corrupt("UTF-8"))?, name)?
+        } else {
+            self.read_legacy_bytes(&fs::read(&path)?, name)?.schema
+        };
+        let arc = Arc::new(schema);
+        self.metas.lock().unwrap_or_else(|p| p.into_inner()).insert(fname.to_string(), arc.clone());
+        Ok(arc)
+    }
+
+    // ───── Cache ─────
+
+    pub(crate) fn load_cached(self: &Arc<Self>, name: &str, fname: &str) -> Result<Arc<TableData>> {
+        let on = self.cache_on.load(AO::Relaxed);
+        if on {
+            if let Some((f, d)) = self.cache.lock().unwrap_or_else(|p| p.into_inner()).get(name) {
+                if f == fname { return Ok(d.clone()); }
+            }
+        }
+        let data = Arc::new(self.read_file(fname, name)?);
+        if on { self.cache_put(name, fname, data.clone()); }
+        Ok(data)
+    }
+
+    pub(crate) fn cache_put(&self, name: &str, fname: &str, d: Arc<TableData>) {
+        if self.cache_on.load(AO::Relaxed) {
+            self.cache.lock().unwrap_or_else(|p| p.into_inner()).insert(name.to_string(), (fname.to_string(), d));
+        }
+    }
+    pub(crate) fn cache_drop(&self, name: &str) {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner()).remove(name);
+    }
+    pub(crate) fn prune_metas(&self, m: &Manifest) {
+        let keep: BTreeSet<&String> = m.tables.values().collect();
+        self.metas.lock().unwrap_or_else(|p| p.into_inner()).retain(|f, _| keep.contains(f));
+    }
+    pub(crate) fn cached(&self, name: &str, fname: &str) -> Option<Arc<TableData>> {
+        let g = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        g.get(name).filter(|(f, _)| f == fname).map(|(_, d)| d.clone())
+    }
+
+    // ───── Snapshots ─────
+
+    /// Leichter Snapshot (nur Manifest). Dateien werden bei Bedarf geöffnet; für
+    /// interne, kurze Abfragen mit Wiederholung bei `SnapshotExpired`.
+    pub(crate) fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+        let manifest = self.read_manifest()?;
+        Ok(Snapshot { store: Arc::clone(self), manifest, loaded: Mutex::new(HashMap::new()), pins: None })
+    }
+
+    /// Fester Snapshot: hält alle Tabellendateien offen. Damit bleibt er beliebig
+    /// lange gültig, auch wenn Schreiber die Dateien inzwischen ersetzen und löschen.
+    pub(crate) fn snapshot_pinned(self: &Arc<Self>) -> Result<Snapshot> {
+        'retry: for _ in 0..64 {
+            let manifest = self.read_manifest()?;
+            let mut pins = HashMap::new();
+            for (name, fname) in &manifest.tables {
+                match File::open(self.dir.join(fname)) {
+                    Ok(f) => { pins.insert(name.clone(), Mutex::new(f)); }
+                    Err(e) if vanished(&e) => { std::thread::yield_now(); continue 'retry }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            return Ok(Snapshot { store: Arc::clone(self), manifest, loaded: Mutex::new(HashMap::new()), pins: Some(pins) });
+        }
+        Err(DbError::SnapshotExpired)
+    }
+
+    /// Führt `f` auf einem frischen Snapshot aus; bei „Datei inzwischen ersetzt“ erneut.
+    pub(crate) fn with_snapshot<R>(self: &Arc<Self>, f: impl Fn(&Snapshot) -> Result<R>) -> Result<R> {
+        let mut last = DbError::SnapshotExpired;
+        for _ in 0..8 {
+            let snap = self.snapshot()?;
+            match f(&snap) {
+                Err(DbError::SnapshotExpired) => { last = DbError::SnapshotExpired; continue; }
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
+    // ───── Integritätsprüfung ─────
+
+    pub(crate) fn integrity_check(self: &Arc<Self>) -> Result<Vec<String>> {
+        let mut problems = Vec::new();
+        let m = self.read_manifest()?;
+        let mut all: HashMap<String, TableData> = HashMap::new();
+        for (name, fname) in &m.tables {
+            match self.read_file(fname, name) {
+                Ok(d) => { all.insert(name.clone(), d); }
+                Err(e) => problems.push(format!("Tabelle '{name}' ({fname}): {e}")),
+            }
+        }
+        for (name, d) in &all {
+            let mut seen: Vec<(usize, HashSet<String>)> =
+                unique_cols(&d.schema).into_iter().map(|c| (c, HashSet::new())).collect();
+            for (rn, r) in d.rows.iter().enumerate() {
+                for (i, c) in d.schema.iter().enumerate() {
+                    if let Err(e) = validate_value(c, cell(r, i)) {
+                        problems.push(format!("{name}[{rn}]: {e}"));
+                    }
+                }
+                if let Err(e) = check_row_local(&d.schema, r) { problems.push(format!("{name}[{rn}]: {e}")); }
+                for (ci, set) in seen.iter_mut() {
+    let c = &d.schema[*ci];
+    let raw = cell(r, *ci);
+    if raw.is_empty() && !c.key && c.unique { continue; }
+    let v = norm_val(c.kind, raw);
+    if !set.insert(v.clone()) {
+        problems.push(format!(
+            "{name}[{rn}]: doppelter Wert '{v}' in eindeutiger Spalte '{}'",
+            c.name
+        ));
+    }
+}
+                for (i, c) in d.schema.iter().enumerate() {
+                    let Some(fk) = &c.fk else { continue };
+                    let v = cell(r, i);
+                    if v.is_empty() { continue; }
+                    let ok = all.get(&fk.table).and_then(|p| p.col(&fk.column).map(|pc| (p, pc)))
+                        .map(|(p, pc)| { let k = p.schema[pc].kind;
+                            p.rows.iter().any(|pr| key_eq(k, cell(pr, pc), v)) })
+                        .unwrap_or(false);
+                    if !ok {
+                        problems.push(format!("{name}[{rn}]: Foreign Key '{}'='{v}' zeigt ins Leere ({}.{})",
+                            c.name, fk.table, fk.column));
+                    }
+                }
+            }
+        }
+        // Verwaiste Dateien sind kein Fehler, aber erwähnenswert.
+        Ok(problems)
+    }
+}
+
+// ───────────── Blockweises Schreiben/Lesen ─────────────
+
+struct ChunkWriter<'a, W: Write> {
+    x: &'a XChaCha20Poly1305,
+    w: &'a mut W,
+    name: &'a str,
+    prefix: [u8; PREFIX_LEN],
+    idx: u32,
+    pending: Option<Vec<u8>>,
+}
+
+impl<'a, W: Write> ChunkWriter<'a, W> {
+    fn push(&mut self, plain: Vec<u8>) -> Result<()> {
+        if let Some(prev) = self.pending.replace(plain) { self.emit(&prev, false)?; }
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        let last = self.pending.take().ok_or(DbError::Corrupt("leere Datei"))?;
+        self.emit(&last, true)
+    }
+    fn emit(&mut self, plain: &[u8], last: bool) -> Result<()> {
+        let nonce = chunk_nonce(&self.prefix, self.idx);
+        let ct = self.x.encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad: &chunk_aad(self.name, last) })
+            .map_err(|_| DbError::Crypto("Verschlüsselung fehlgeschlagen"))?;
+        self.w.write_all(&(ct.len() as u32).to_le_bytes())?;
+        self.w.write_all(&ct)?;
+        self.idx = self.idx.checked_add(1).ok_or(DbError::Corrupt("zu viele Blöcke"))?;
+        Ok(())
+    }
+}
+
+pub(crate) struct ChunkReader {
+    store: Arc<Store>,
+    name: String,
+    prefix: [u8; PREFIX_LEN],
+    idx: u32,
+    done: bool,
+}
+
+impl ChunkReader {
+    fn read_ct(&self, br: &mut BufReader<File>) -> Result<Vec<u8>> {
+        let mut lenb = [0u8; 4];
+        br.read_exact(&mut lenb).map_err(|_| DbError::Corrupt("Datei abgeschnitten"))?;
+        let len = u32::from_le_bytes(lenb) as usize;
+        if len < TAG_LEN || len > MAX_CHUNK { return Err(DbError::Corrupt("ungültige Blockgröße")); }
+        let mut ct = vec![0u8; len];
+        br.read_exact(&mut ct).map_err(|_| DbError::Corrupt("Datei abgeschnitten"))?;
+        Ok(ct)
+    }
+
+    fn open_block(&self, ct: &[u8], last: bool) -> Result<Vec<u8>> {
+        let nonce = chunk_nonce(&self.prefix, self.idx);
+        self.store.x.decrypt(XNonce::from_slice(&nonce), Payload { msg: ct, aad: &chunk_aad(&self.name, last) })
+            .map_err(|_| DbError::Crypto("Entschlüsselung fehlgeschlagen (Datei verändert oder beschädigt)"))
+    }
+
+    /// Nächster Block; `None` nach dem letzten. Erkennt Abschneiden/Anhängen über das Last-Flag.
+    pub(crate) fn next(&mut self, br: &mut BufReader<File>) -> Result<Option<Vec<u8>>> {
+        if self.done { return Ok(None); }
+        let ct = self.read_ct(br)?;
+        let last = br.fill_buf()?.is_empty();
+        let pt = self.open_block(&ct, last)?;
+        self.idx = self.idx.checked_add(1).ok_or(DbError::Corrupt("zu viele Blöcke"))?;
+        if last { self.done = true; }
+        Ok(Some(pt))
+    }
+
+    /// Nur Block 0 lesen (Kopf), ohne den Rest der Datei zu prüfen.
+    fn next_no_last_check(&mut self, br: &mut BufReader<File>) -> Result<Vec<u8>> {
+        let ct = self.read_ct(br)?;
+        let last = br.fill_buf()?.is_empty();
+        self.open_block(&ct, last)
+    }
+}
+
+fn parse_rows_chunk(chunk: &[u8], ncols: usize, out: &mut Vec<Vec<String>>) -> Result<()> {
+    let text = std::str::from_utf8(chunk).map_err(|_| DbError::Corrupt("kein gültiges UTF-8"))?;
+    for line in text.split('\n') {
+        if let Some(rest) = line.strip_prefix("ROW:") {
+            let mut r = split_cells_v2(rest);
+            r.resize(ncols, String::new());
+            out.push(r);
+        }
+    }
+    Ok(())
+}
+
+// ───────────── Streaming-Scan ─────────────
+
+pub(crate) enum ScanSrc {
+    Mem(Arc<TableData>, usize),
+    File { br: BufReader<File>, cr: ChunkReader, buf: VecDeque<Vec<String>> },
+}
+
+pub(crate) struct Scan { pub(crate) schema: Vec<ColDef>, src: ScanSrc }
+
+impl Scan {
+    pub(crate) fn next_row(&mut self) -> Result<Option<Vec<String>>> {
+        match &mut self.src {
+            ScanSrc::Mem(d, pos) => {
+                let r = d.rows.get(*pos).cloned();
+                if r.is_some() { *pos += 1; }
+                Ok(r)
+            }
+            ScanSrc::File { br, cr, buf } => loop {
+                if let Some(r) = buf.pop_front() { return Ok(Some(r)); }
+                match cr.next(br)? {
+                    None => return Ok(None),
+                    Some(chunk) => {
+                        let mut v = Vec::new();
+                        parse_rows_chunk(&chunk, self.schema.len(), &mut v)?;
+                        buf.extend(v);
+                    }
+                }
+            },
+        }
+    }
+}
+
+impl Store {
+    /// Öffnet einen blockweisen Scan. Ist die Tabelle im Cache, wird von dort gelesen.
+    pub(crate) fn open_scan(self: &Arc<Self>, snap: &Snapshot, name: &str) -> Result<Scan> {
+        let fname = snap.manifest.tables.get(name).ok_or_else(|| DbError::TableNotFound(name.to_string()))?;
+        if snap.pins.is_some() {
+            let d = snap.data(name)?;
+            return Ok(Scan { schema: d.schema.clone(), src: ScanSrc::Mem(d, 0) });
+        }
+        if let Some(d) = self.cached(name, fname) {
+            return Ok(Scan { schema: d.schema.clone(), src: ScanSrc::Mem(d, 0) });
+        }
+        let path = self.dir.join(fname);
+        let mut magic = [0u8; 4];
+        let is_v3 = {
+            let mut f = File::open(&path).map_err(|e| snap_err(e))?;
+            f.read_exact(&mut magic).is_ok() && &magic == MAGIC_TABLE
+        };
+        if !is_v3 {
+            let d = Arc::new(self.read_file(fname, name)?);
+            return Ok(Scan { schema: d.schema.clone(), src: ScanSrc::Mem(d, 0) });
+        }
+        let mut br = BufReader::with_capacity(128 * 1024, File::open(&path).map_err(|e| snap_err(e))?);
+        let mut cr = self.open_chunks(&mut br, name)?;
+        let head = cr.next(&mut br)?.ok_or(DbError::Corrupt("Kopf fehlt"))?;
+        let schema = parse_header(&String::from_utf8(head).map_err(|_| DbError::Corrupt("UTF-8"))?, name)?;
+        Ok(Scan { schema, src: ScanSrc::File { br, cr, buf: VecDeque::new() } })
+    }
+}
+
+fn snap_err(e: io::Error) -> DbError {
+    if vanished(&e) { DbError::SnapshotExpired } else { DbError::Io(e) }
+}
+
+// ───────────── Snapshot ─────────────
+
+/// Fester, konsistenter Lese-Stand der ganzen Datenbank.
+///
+/// Alle Abfragen über denselben Snapshot sehen exakt denselben Stand – auch
+/// über mehrere Tabellen – egal, was Schreiber inzwischen committen. Ein mit
+/// [`DBCore::snapshot`] erzeugter Snapshot hält seine Dateien offen und bleibt
+/// deshalb beliebig lange gültig (kostet nur einen Datei-Handle pro Tabelle,
+/// bis er gedroppt wird).
+pub struct Snapshot {
+    pub(crate) store: Arc<Store>,
+    pub(crate) manifest: Manifest,
+    loaded: Mutex<HashMap<String, Arc<TableData>>>,
+    pins: Option<HashMap<String, Mutex<File>>>,
+}
+
+impl Snapshot {
+    pub fn tables(&self) -> Vec<String> { self.manifest.tables.keys().cloned().collect() }
+    pub fn has_table(&self, t: &str) -> bool { self.manifest.tables.contains_key(t) }
+    pub fn user_version(&self) -> u32 { self.manifest.user_version }
+
+    /// Abfrage auf diesem Snapshot.
+    pub fn table<'a>(&'a self, name: &str) -> Table<'a> { Table::on_snapshot(self, name) }
+
+    pub(crate) fn data(&self, name: &str) -> Result<Arc<TableData>> {
+        if !valid_name(name) { return Err(DbError::InvalidName); }
+        if let Some(d) = self.loaded.lock().unwrap_or_else(|p| p.into_inner()).get(name) { return Ok(d.clone()); }
+        let fname = self.manifest.tables.get(name).ok_or_else(|| DbError::TableNotFound(name.to_string()))?;
+        let d = match self.pins.as_ref().and_then(|p| p.get(name)) {
+            Some(pin) => match self.store.cached(name, fname) {
+                Some(d) => d,
+                None => {
+                    // Gepinnt: aus dem offenen Handle lesen, nie aus dem (evtl. gelöschten) Pfad.
+                    let f = pin.lock().unwrap_or_else(|p| p.into_inner());
+                    let d = Arc::new(self.store.read_handle(f.try_clone()?, name)?);
+                    self.store.cache_put(name, fname, d.clone());
+                    d
+                }
+            },
+            None => self.store.load_cached(name, fname).map_err(|e| {
+                if is_not_found(&e) { DbError::SnapshotExpired } else { e }
+            })?,
+        };
+        self.loaded.lock().unwrap_or_else(|p| p.into_inner()).insert(name.to_string(), d.clone());
+        Ok(d)
+    }
+
+    pub(crate) fn get_row(&self, table: &str, key: &str) -> Result<Option<Vec<String>>> {
+        let d = self.data(table)?;
+        let ki = key_index(&d.schema).ok_or_else(|| DbError::SchemaMismatch(
+            "get() braucht eine @key-Spalte im Schema".into()))?;
+        let idx = d.index(ki);
+        Ok(idx.get(key).first().map(|&p| d.rows[p].clone()))
+    }
+}

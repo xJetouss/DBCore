@@ -1,0 +1,123 @@
+#	Thema	Inhalt	Aufwand
+P1	WAL & Crash Recovery	Write-Ahead-Log, Checkpointing, Recovery beim Öffnen, Torn-Write-Erkennung, Kill-Injection-Tests	🔴
+P2	MVCC & Concurrency	Mehrere gleichzeitige Leser und Schreiber, Schreib-Locks pro Tabelle oder Zeile, Konflikterkennung (optimistisch), Garbage Collection alter Versionen	🔴
+P3	Native Datentypen	Value-Enum mit Null, Int, Float, Text, Bool, Blob, Timestamp/Date/Time, Uuid, Json, Decimal. Echtes NULL statt leerem String. Typisierte Parameter	🔴
+P4	Query Optimizer	Statistiken (Zeilenzahl, Distinct-Werte, Histogramme), kostenbasierte Indexwahl, Join-Reihenfolge, Predicate Pushdown, explain analyze	🔴
+P5	Backup & Restore	Online-Backup aus einem Snapshot, Wiederherstellung, Integritätsprüfung des Backups, inkrementelle Backups	🟡
+P6	Composite Indexes	Mehrspaltig (user_id + created_at), Prefix-Nutzung, Teilindizes, Ausdrucksindizes, Covering Indexes	🟡
+P7	SQL-Subset & Prepared Statements	Parser (SELECT … WHERE x = $1), Abbildung auf den bestehenden Planer, Prepared Statements, berechnete Spalten, CASE, String-Funktionen	🟡–🔴
+
+Abhängigkeiten: P3 (Typen) zuerst, denn P4, P6 und P7 bauen darauf auf. P1 (WAL) vor P2 (MVCC), weil die Nebenläufigkeit auf dem Log aufsetzt. Mit P5 kannst du früh anfangen, weil du die Snapshots schon hast.
+
+Speicher und Storage-Engine
+Seitenbasiertes Format (B-Tree oder LSM) statt Tabellen als Ganzes
+Page-Cache mit konfigurierbarer Größe und LRU/Clock-Verdrängung
+Persistente Indizes auf der Platte statt Aufbau im Speicher beim ersten Zugriff
+Datenbanken größer als RAM
+Kompression pro Seite (LZ4/Zstd), danach erst verschlüsseln
+Online-Kompaktierung/vacuum, Aufräumen alter Copy-on-Write-Dateien
+Freispeicherverwaltung und Seitenwiederverwendung
+Große Werte (Blobs) in eigenen Overflow-Seiten
+Memory-Mapped-I/O als Option
+Direct I/O und Vorab-Allokation
+Nebenläufigkeit und Transaktionen
+Savepoints und verschachtelte Teil-Rollbacks
+Isolationslevel (Read Committed, Snapshot, Serializable)
+Schreib-Locks pro Tabelle, später pro Zeile
+Dateisperren zwischen mehreren Prozessen (flock)
+Deadlock-Erkennung und Wiederholversuche bei Konflikten
+Read-only-Transaktionen und Lese-Pinning mit Ablaufzeit
+Group Commit, damit viele Schreiber sich ein fsync teilen
+Async-API (Tokio) neben der synchronen
+Aufgeschobene Constraints (deferred) bis zum Commit
+Langlaufende Transaktionen überwachen
+Datentypen und Schema
+Nullable als echtes Konzept (Option<T> im Schema)
+Datum/Zeit mit Zeitzone, Intervalle
+Decimal/Festkomma für Geldbeträge
+Arrays, Enums, benutzerdefinierte Typen
+Dynamische Defaults: now(), uuid(), Zufallswerte
+Sequenzen und Auto-Inkrement unabhängig vom Key
+Generierte Spalten (berechnet, gespeichert oder virtuell)
+Zusammengesetzte Primärschlüssel
+ALTER COLUMN (Typ ändern, Default ändern, NOT NULL nachträglich)
+Schema-Diff und automatische Migrationsvorschläge
+Views und materialisierte Views
+Mehrere Namensräume/Schemas innerhalb einer Datenbank
+Constraints und Integrität
+ON DELETE SET NULL / SET DEFAULT, ON UPDATE CASCADE
+UNIQUE über mehrere Spalten
+CHECK über mehrere Spalten und mit Ausdrücken
+Exclusion Constraints
+Trigger (vor/nach Insert, Update, Delete)
+Prüfsummen pro Seite und Hintergrund-Scrubbing
+Automatische Reparatur oder Quarantäne beschädigter Seiten
+Integritätsprüfung inkrementell und mit Fortschrittsanzeige
+Abfragen
+Mehrfach-Joins in einer Kette, RIGHT/FULL/CROSS Join, Nicht-Gleichheits-Joins
+Joins auf Union und Unterabfragen (aktuell Unsupported)
+Skalare Unterabfragen, EXISTS, korrelierte Unterabfragen
+CTEs (WITH) und rekursive CTEs
+Window-Funktionen (row_number, rank, lag, lead, laufende Summen)
+INTERSECT und EXCEPT
+Mehr Aggregate: stddev, median, group_concat, count distinct
+ORDER BY mit Ausdrücken und NULLS FIRST/LAST
+Kombinierte Sortierung nach mehreren Spalten mit Index-Nutzung
+Cursor-basierte Paginierung (Keyset statt Offset)
+UPSERT mit Konfliktregel (ON CONFLICT DO UPDATE)
+RETURNING bei Insert, Update, Delete
+Volltextsuche (invertierter Index, Ranking, Stemming)
+JSON-Pfadabfragen und JSON-Indizes
+Geodaten/Bereichsindizes (R-Tree) als spätere Erweiterung
+Vektorsuche (ANN) für KI-Anwendungen
+Optimizer und Performance
+Statistiken sammeln (analyze) und automatisch aktuell halten
+Join-Strategien: Hash, Merge, Nested Loop mit Indexzugriff
+Plan-Cache für wiederholte Abfragen
+Parallele Scans und parallele Aggregation
+Vektorisierte Ausführung für Aggregate
+Bloom-Filter für Existenzprüfungen
+Batch-Inserts und Bulk-Load-Modus
+Benchmarks gegen SQLite, redb und sled in CI
+Profiling-Hooks und Metriken (Cache-Treffer, Lock-Wartezeit, Scan-Größen)
+Langsame-Abfragen-Log
+API und Developer Experience
+Standardmäßig Result zurückgeben. Die stillen Kurzformen (false, "", 0) verschleiern Fehler und sollten klar abgetrennt oder abgeschafft werden
+#[derive(Model)] statt des model!-Makros
+Typisierte Query-Builder-Parameter (where_eq("id", 5))
+Compile-Zeit-geprüfte Abfragen (Makro, das gegen das Schema prüft)
+Bessere Fehlermeldungen mit Tabelle, Spalte, Wert und Vorschlag
+Logging über das tracing-Crate
+Change-Subscriptions und Hooks als Ersatz für LISTEN/NOTIFY
+Konfigurationsstruct (Options) statt vieler set_*-Methoden
+Feature-Flags für optionale Teile (Web-Interface, Export, Async)
+no_std/WASM-Build
+Vollständige Doku mit Beispielen (cargo doc) und ein Tutorial
+Sicherheit und Verschlüsselung
+Passwortbasierte Schlüsselableitung (Argon2id) mit Salt
+Key-Rotation ohne komplettes Neuschreiben
+Schlüssel im OS-Keychain/Secret Service
+Getrennte Schlüssel pro Tabelle oder Datei
+Speicher mit Schlüsseln sicher löschen (zeroize)
+Nonce-Verwaltung prüfen (keine Wiederverwendung bei ChaCha20-Poly1305)
+Verschlüsselte Backups
+Optionale Benutzer und Rechte, falls das Web-Interface oder ein Server-Modus dazukommt
+Web-Interface: Authentifizierung per Token, Schreibschutz-Modus
+Ökosystem und Werkzeuge
+CLI/Shell (dbcore shell) mit Tab-Completion und .tables-Befehlen
+Import/Export: SQLite, CSV, JSON, pg_dump-Subset
+Optionales Postgres-Wire-Protokoll hinter einem Feature-Flag, damit psql und ORMs verbinden
+Treiber für sqlx/diesel oder ein eigener ORM-Layer
+Bindings: C-FFI, Python, Node.js
+Inspektions-Tool für Dateiformat und Seiten (dbcore inspect)
+Replikation oder Sync (Log-Shipping vom WAL)
+Graphische Oberfläche: das Web-Interface um Schemaeditor und SQL-Konsole erweitern
+Qualität und Tests
+Property-Based-Tests (proptest) gegen SQLite als Referenz
+Fuzzing von Parser, Dateiformat und Entschlüsselung
+Crash-Tests: Prozess zufällig beenden, danach integrity_check
+Fehlerinjektion im Dateisystem (volle Platte, abgebrochene Writes)
+Nebenläufigkeitstests (loom, Stresstests mit vielen Threads)
+Abwärtskompatibilität: Dateiformat-Version und Migrationstests
+CI mit Linux, macOS, Windows und Miri
+Code-Coverage und Mutation-Testing

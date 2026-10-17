@@ -65,7 +65,8 @@ pub(crate) fn format_terminal(schema: &[ColDef], rows: &[Vec<String>]) -> String
     }
     for r in rows {
         for i in 0..cols {
-            let len = cell(r, i).chars().count();
+            let raw = cell(r, i);
+            let len = if raw == NULL_CELL { 4 } else { display_value(raw).chars().count() };
             if len > widths[i] { widths[i] = len; }
         }
     }
@@ -91,7 +92,9 @@ pub(crate) fn format_terminal(schema: &[ColDef], rows: &[Vec<String>]) -> String
         out.push('│');
         for i in 0..cols {
             // Zeilenumbrüche/Tabs würden das Raster zerstören.
-            let v = cell(r, i).replace(['\n', '\r', '\t'], " ");
+            let raw = cell(r, i);
+            let v = if raw == NULL_CELL { "NULL" } else { display_value(raw) }
+                .replace(['\n', '\r', '\t'], " ");
             out.push_str(&format!(" {:width$} │", v, width = widths[i]));
         }
         out.push('\n');
@@ -123,7 +126,7 @@ pub(crate) fn format_csv(schema: &[ColDef], rows: &[Vec<String>]) -> String {
     for r in rows {
         for i in 0..schema.len() {
             if i > 0 { out.push(','); }
-            out.push_str(&csv_escape(cell(r, i)));
+            out.push_str(&csv_escape(display_value(cell(r, i))));
         }
         out.push_str("\r\n");
     }
@@ -149,15 +152,22 @@ pub(crate) fn json_escape(s: &str) -> String {
 }
 
 pub(crate) fn json_value(c: &ColDef, v: &str) -> String {
-    let quoted = || format!("\"{}\"", json_escape(v));
+    let quoted = || format!("\"{}\"", json_escape(display_value(v)));
+    if v == NULL_CELL { return "null".to_string(); }
     match c.kind {
         // `parse::<f64>` akzeptiert auch "NaN"/"inf" – das ist kein gültiges JSON.
-        ColumnKind::Int => v.parse::<i64>().map(|n| n.to_string()).unwrap_or_else(|_| quoted()),
+        ColumnKind::Int => v.parse::<i128>().map(|n| n.to_string())
+            .or_else(|_| v.parse::<u128>().map(|n| n.to_string())).unwrap_or_else(|_| quoted()),
         ColumnKind::Float => match v.parse::<f64>() {
             Ok(f) if f.is_finite() => f.to_string(),
             _ => quoted(),
         },
         ColumnKind::Bool if v == "true" || v == "false" => v.to_string(),
+        ColumnKind::Json if serde_json::from_str::<serde_json::Value>(v).is_ok() => v.to_string(),
+        ColumnKind::Decimal if valid_decimal(v) => v.to_string(),
+        ColumnKind::Blob => quoted(),
+        ColumnKind::Timestamp | ColumnKind::Date | ColumnKind::Time
+            if v.parse::<i128>().is_ok() => v.to_string(),
         _ => quoted(),
     }
 }
@@ -234,11 +244,11 @@ pub(crate) fn format_html(title: &str, schema: &[ColDef], rows: &[Vec<String>]) 
         out.push_str("<tr>");
         for i in 0..schema.len() {
             let v = cell(r, i);
-            if v.is_empty() {
+            if v == NULL_CELL {
                 out.push_str("<td class=\"empty\">—</td>");
             } else {
                 out.push_str("<td>");
-                out.push_str(&html_escape(v));
+                out.push_str(&html_escape(display_value(v)));
                 out.push_str("</td>");
             }
         }

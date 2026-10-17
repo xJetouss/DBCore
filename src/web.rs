@@ -228,20 +228,32 @@ fn route(db: &DBCore, req: &Request) -> Resp {
 /// werden weggelassen, damit Auto-Key bzw. Default greifen – sonst würde
 /// ein leeres Key-Feld als `""` gespeichert.
 fn form_values<'a>(
-    schema: &[ColDef],
+    schema: &'a [ColDef],
     form: &'a [(String, String)],
     drop_empty: bool,
 ) -> Vec<(&'a str, String)> {
-    form.iter()
+    let mut values: Vec<(&'a str, String)> = form.iter()
+        .filter(|(k, _)| !schema.iter().any(|c| k == &format!("__null__{}", c.name)))
         .filter(|(k, v)| {
             if !drop_empty || !v.is_empty() { return true; }
             match schema.iter().find(|c| c.name == *k) {
-                Some(c) => !(c.key || c.default.is_some()),
+                Some(c) => !(c.key || c.default_value().is_some()),
                 None => true,
             }
         })
         .map(|(k, v)| (k.as_str(), v.clone()))
-        .collect()
+        .collect();
+    for c in schema {
+        let null_name = format!("__null__{}", c.name);
+        if !c.not_null
+            && !c.key
+            && form.iter().any(|(k, v)| k == &null_name && v == "1")
+        {
+            values.retain(|(k, _)| *k != c.name);
+            values.push((c.name.as_str(), NULL_CELL.to_string()));
+        }
+    }
+    values
 }
 
 /// Ersetzt die Zeile atomar – aber nur, wenn sie noch unverändert ist.
@@ -809,22 +821,31 @@ fn render_form(db: &DBCore, name: &str, mode: Form, idx: Option<usize>) -> Resul
         html_escape(&action)
     ));
     for (i, c) in schema.iter().enumerate() {
+        let is_null = existing.is_some_and(|r| cell(r, i) == NULL_CELL);
         let current = match existing {
-            Some(r) => cell(r, i).to_string(),
-            None => c.default.clone().unwrap_or_default(),
+            Some(r) => display_value(cell(r, i)).to_string(),
+            None => c.default_value().unwrap_or_default().to_string(),
         };
         let kind = match c.kind {
+            ColumnKind::Null  => "NULL",
             ColumnKind::Int   => "Ganzzahl",
             ColumnKind::Float => "Kommazahl",
             ColumnKind::Bool  => "true/false",
             ColumnKind::Text  => "Text",
+            ColumnKind::Blob => "Blob",
+            ColumnKind::Timestamp => "Timestamp",
+            ColumnKind::Date => "Date",
+            ColumnKind::Time => "Time",
+            ColumnKind::Uuid => "UUID",
+            ColumnKind::Json => "JSON",
+            ColumnKind::Decimal => "Decimal",
         };
         let key_marker = if c.key { "<span class=\"keymark\">@key</span>" } else { "" };
-        let default_hint = c.default.as_ref()
+        let default_hint = c.default_value()
             .map(|d| format!(" · Default <code>{}</code>", html_escape(d)))
             .unwrap_or_default();
-        let placeholder = match (&c.default, c.key, mode) {
-            (Some(d), _, _)          => d.clone(),
+        let placeholder = match (c.default_value(), c.key, mode) {
+            (Some(d), _, _)          => d.to_string(),
             (None, true, Form::Put)  => "automatisch".to_string(),
             _                        => String::new(),
         };
@@ -843,6 +864,14 @@ fn render_form(db: &DBCore, name: &str, mode: Form, idx: Option<usize>) -> Resul
             html_escape(&current),
             html_escape(&placeholder)
         ));
+        if !c.not_null && !c.key {
+            b.push_str(&format!(
+                "<label class=\"null-toggle\"><input type=\"checkbox\" name=\"__null__{}\" \
+                 value=\"1\"{}> NULL</label>",
+                html_escape(&c.name),
+                if is_null { " checked" } else { "" }
+            ));
+        }
     }
     b.push_str("<div class=\"form-actions\">");
     b.push_str(&format!("<button class=\"btn primary\" type=\"submit\">{}</button>",
@@ -852,6 +881,40 @@ fn render_form(db: &DBCore, name: &str, mode: Form, idx: Option<usize>) -> Resul
     b.push_str("</div></form>");
 
     Ok(shell(&title, Some(name), db, &b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn form_values_preserves_null_and_empty_text() {
+        let schema = schema! {
+            @key id: i32,
+            nullable: Option<String>,
+            text: String,
+            required: Option<String>,
+        }
+        .not_null(&["required"]);
+        let form = vec![
+            ("id".to_string(), "1".to_string()),
+            ("nullable".to_string(), "ignored".to_string()),
+            ("__null__nullable".to_string(), "1".to_string()),
+            ("text".to_string(), String::new()),
+            ("required".to_string(), "value".to_string()),
+            ("__null__required".to_string(), "1".to_string()),
+        ];
+        let values = form_values(&schema.columns, &form, false);
+        assert_eq!(
+            values,
+            vec![
+                ("id", "1".to_string()),
+                ("text", String::new()),
+                ("required", "value".to_string()),
+                ("nullable", NULL_CELL.to_string()),
+            ]
+        );
+    }
 }
 
 // ───────────── CSS ─────────────
@@ -1181,6 +1244,8 @@ table.data td.actions .btn{margin-left:.15rem}
   box-shadow:var(--shadow-sm);max-width:560px;
 }
 .field{display:block;margin-bottom:.85rem}
+.null-toggle{display:flex;align-items:center;gap:.35rem;margin:-.55rem 0 .85rem;
+  color:var(--muted);font-size:.85em}
 .flabel{
   display:flex;align-items:baseline;gap:.4rem;flex-wrap:wrap;
   margin-bottom:.3rem;font-size:.85em;

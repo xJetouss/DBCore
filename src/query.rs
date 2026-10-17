@@ -90,6 +90,7 @@ enum Cond<'a> {
     Between { col: String, lo: String, hi: String },
     In { col: String, vals: Vec<String> },
     Like { col: String, pat: String },
+    Null { col: String, negate: bool },
     InQuery { col: String, sub: Box<Table<'a>>, negate: bool },
 }
 
@@ -98,10 +99,15 @@ enum PCond {
     Between { ci: usize, kind: ColumnKind, lo: String, hi: String },
     InSet { ci: usize, kind: ColumnKind, set: HashSet<String>, negate: bool },
     Like { ci: usize, pat: String },
+    Null { ci: usize, negate: bool },
 }
 
 impl PCond {
     fn eval(&self, row: &[String]) -> bool {
+        if let PCond::Null { ci, negate } = self {
+            return is_null(row, *ci) != *negate;
+        }
+        if is_null(row, self.col()) { return false; }
         match self {
             PCond::Cmp { ci, kind, op, val } => op.holds(cmp_values(*kind, cell(row, *ci), val)),
             PCond::Between { ci, kind, lo, hi } => {
@@ -110,11 +116,12 @@ impl PCond {
             }
             PCond::InSet { ci, kind, set, negate } => set.contains(&norm_val(*kind, cell(row, *ci))) != *negate,
             PCond::Like { ci, pat } => like_match(pat, cell(row, *ci)),
+            PCond::Null { .. } => false,
         }
     }
     fn col(&self) -> usize {
         match self { PCond::Cmp { ci, .. } | PCond::Between { ci, .. }
-            | PCond::InSet { ci, .. } | PCond::Like { ci, .. } => *ci }
+            | PCond::InSet { ci, .. } | PCond::Like { ci, .. } | PCond::Null { ci, .. } => *ci }
     }
 }
 
@@ -125,6 +132,14 @@ enum Src<'a> {
     Base { name: String, joins: Vec<JoinSpec> },
     Derived(Box<Table<'a>>),
     Union(Box<Table<'a>>, Box<Table<'a>>, bool),
+}
+
+fn encode_query_value(kind: ColumnKind, value: &str) -> String {
+    if kind == ColumnKind::Text && value.starts_with(NULL_CELL) {
+        format!("{NULL_CELL}{value}")
+    } else {
+        value.to_string()
+    }
 }
 
 pub(crate) struct Rs { pub(crate) schema: Vec<ColDef>, pub(crate) rows: Vec<Vec<String>> }
@@ -225,6 +240,10 @@ impl<'a> Table<'a> {
     pub fn where_like(self, col: &str, pattern: &str) -> Self {
         self.cond(Cond::Like { col: col.into(), pat: pattern.into() })
     }
+    /// Match only genuine SQL NULL values.
+    pub fn where_null(self, col: &str) -> Self { self.cond(Cond::Null { col: col.into(), negate: false }) }
+    /// Exclude genuine SQL NULL values.
+    pub fn where_not_null(self, col: &str) -> Self { self.cond(Cond::Null { col: col.into(), negate: true }) }
     /// `col IN (SELECT …)` – die Unterabfrage liefert in ihrer ersten Spalte die Werte.
     pub fn where_in_query(self, col: &str, sub: Table<'a>) -> Self {
         self.cond(Cond::InQuery { col: col.into(), sub: Box::new(sub), negate: false })
@@ -325,18 +344,27 @@ impl<'a> Table<'a> {
             out.push(match c {
                 Cond::Cmp { col, op, val } => {
                     let ci = resolve_col(schema, col)?;
-                    PCond::Cmp { ci, kind: schema[ci].kind, op: *op, val: val.clone() }
+                    let kind = schema[ci].kind;
+                    PCond::Cmp { ci, kind, op: *op, val: encode_query_value(kind, val) }
                 }
                 Cond::Between { col, lo, hi } => {
                     let ci = resolve_col(schema, col)?;
-                    PCond::Between { ci, kind: schema[ci].kind, lo: lo.clone(), hi: hi.clone() }
+                    let kind = schema[ci].kind;
+                    PCond::Between {
+                        ci, kind, lo: encode_query_value(kind, lo), hi: encode_query_value(kind, hi),
+                    }
                 }
                 Cond::In { col, vals } => {
                     let ci = resolve_col(schema, col)?;
                     let kind = schema[ci].kind;
-                    PCond::InSet { ci, kind, set: vals.iter().map(|v| norm_val(kind, v)).collect(), negate: false }
+                    PCond::InSet {
+                        ci, kind,
+                        set: vals.iter().map(|v| norm_val(kind, &encode_query_value(kind, v))).collect(),
+                        negate: false,
+                    }
                 }
                 Cond::Like { col, pat } => PCond::Like { ci: resolve_col(schema, col)?, pat: pat.clone() },
+                Cond::Null { col, negate } => PCond::Null { ci: resolve_col(schema, col)?, negate: *negate },
                 Cond::InQuery { col, sub, negate } => {
                     let ci = resolve_col(schema, col)?;
                     let kind = schema[ci].kind;
@@ -428,14 +456,8 @@ impl<'a> Table<'a> {
                     for &p in poss {
                         if !passes(p) { continue; }
                         if skipped < s { skipped += 1; continue; }
-                       'outer: for poss in idx.ordered(*desc) {
-    for &p in poss {
-        if !passes(p) { continue; }
-        if skipped < s { skipped += 1; continue; }
-        if limit.map_or(false, |l| out.len() >= l) { break 'outer; }
-        out.push(p);
-    }
-}
+                        if limit.map_or(false, |l| out.len() >= l) { break 'outer; }
+                        out.push(p);
                     }
                 }
                 out
@@ -616,7 +638,7 @@ impl<'a> Table<'a> {
                 acc.count += 1;
                 let Some(ci) = agg_idx[ai] else { continue };
                 let v = cell(r, ci);
-                if v.is_empty() { continue; }
+                if v == NULL_CELL { continue; }
                 acc.nonempty += 1;
                 let kind = rs.schema[ci].kind;
                 if let Ok(f) = v.parse::<f64>() {
@@ -722,14 +744,18 @@ impl<'a> Table<'a> {
     // ───── Terminal: Daten ─────
 
     /// Alle Treffer. Bei Fehler: leerer `Vec` (Fehler auf stderr).
-    pub fn collect(&self) -> Vec<Vec<String>> { self.run().map(|r| r.rows).unwrap_or_default() }
-    pub fn try_collect(&self) -> DbResult<Vec<Vec<String>>> { self.execute().map(|r| r.rows) }
+    pub fn collect(&self) -> Vec<Vec<String>> { report(self.try_collect()).unwrap_or_default() }
+    pub fn try_collect(&self) -> DbResult<Vec<Vec<String>>> {
+        let rs = self.execute()?;
+        Ok(rs.rows.iter().map(|r| display_row(&rs.schema, r)).collect())
+    }
 
     /// Erste Zeile. Leerer `Vec` = keine Treffer.
     pub fn first(&self) -> Vec<String> { self.try_first().ok().flatten().unwrap_or_default() }
     pub fn try_first(&self) -> DbResult<Option<Vec<String>>> {
-        let mut q = self.shallow_limit(1);
-        Ok(q.try_collect_inner()?.into_iter().next())
+        let q = self.shallow_limit(1);
+        let rs = q.execute()?;
+        Ok(rs.rows.first().map(|r| display_row(&rs.schema, r)))
     }
 
     /// Erste Zelle der ersten Zeile (SELECT VALUE). `""` = keine Treffer.
@@ -743,7 +769,7 @@ impl<'a> Table<'a> {
     pub fn try_values(&self, col: &str) -> DbResult<Vec<String>> {
         let rs = self.execute()?;
         let idx = resolve_col(&rs.schema, col)?;
-        Ok(rs.rows.into_iter().map(|mut r| if idx < r.len() { r.swap_remove(idx) } else { String::new() }).collect())
+        Ok(rs.rows.iter().map(|r| display_value(cell(r, idx)).to_string()).collect())
     }
 
     /// Gibt es mindestens einen Treffer?
@@ -809,10 +835,10 @@ impl<'a> Table<'a> {
         let rs = self.execute()?;
         let idx = resolve_col(&rs.schema, col)?;
         let kind = rs.schema[idx].kind;
-        let vals = rs.rows.iter().map(|r| cell(r, idx));
+        let vals = rs.rows.iter().map(|r| cell(r, idx)).filter(|v| *v != NULL_CELL);
         let best = if want_max { vals.max_by(|a, b| cmp_values(kind, a, b)) }
                    else { vals.min_by(|a, b| cmp_values(kind, a, b)) };
-        Ok(best.map(str::to_string))
+        Ok(best.map(|v| display_value(v).to_string()))
     }
 
     // ───── Terminal: Ausgabe ─────
@@ -948,7 +974,6 @@ impl<'t, 'a> LimitedView<'t, 'a> {
         let lim = self.eff_limit();
         self.t.ctx.read(&|rd| self.t.exec_limited(rd, lim))
     }
-    fn try_collect_inner(&mut self) -> Result<Vec<Vec<String>>> { Ok(self.execute()?.rows) }
 }
 
 impl<'a> Table<'a> {
@@ -999,7 +1024,7 @@ impl<'a> Iterator for RowStream<'a> {
     type Item = DbResult<Vec<String>>;
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            StreamInner::Mem(it) => it.next().map(Ok),
+            StreamInner::Mem(it) => it.next().map(|r| Ok(r.iter().map(|v| display_value(v).to_string()).collect())),
             StreamInner::Lazy(l) => {
                 if l.failed { return None; }
                 loop {
@@ -1014,8 +1039,8 @@ impl<'a> Iterator for RowStream<'a> {
                             if l.skip > 0 { l.skip -= 1; continue; }
                             l.emitted += 1;
                             return Some(Ok(match &l.proj {
-                                None => row,
-                                Some((keep, _)) => keep.iter().map(|&c| cell(&row, c).to_string()).collect(),
+                                None => row.iter().map(|v| display_value(v).to_string()).collect(),
+                                Some((keep, _)) => keep.iter().map(|&c| display_value(cell(&row, c)).to_string()).collect(),
                             }));
                         }
                     }
@@ -1050,5 +1075,21 @@ impl<'a> IntoIterator for Table<'a> {
                 Rows(RowStream { inner: StreamInner::Mem(Vec::new().into_iter()) })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_order_scan_applies_limit_without_duplicates() {
+        let db = DBCore::temp();
+        db.create("items", schema! { @key id: i32, rank: i32 }.index(&["rank"]));
+        for id in (1..=5).rev() {
+            db.add("items", row! { id: id, rank: id });
+        }
+        assert_eq!(db.table("items").order_by("rank").limit(3).values("rank"), ["1", "2", "3"]);
+        assert_eq!(db.table("items").order_by("rank").skip(2).limit(2).values("rank"), ["3", "4"]);
     }
 }

@@ -22,6 +22,20 @@
 //!     .print();
 //! ```
 //!
+//! Native parameter values preserve the difference between `NULL` and an
+//! empty string:
+//! ```no_run
+//! use dbcore::{DBCore, Value, params, schema};
+//! let db = DBCore::temp();
+//! db.create("notes", schema! { @key id: i32, body: Option<String> });
+//! db.try_add_values("notes", params! { id: 1, body: Value::Null }).unwrap();
+//! assert_eq!(db.try_get_value("notes", "1", "body").unwrap(), Some(Value::Null));
+//! ```
+//! `Timestamp` zählt Mikrosekunden seit Unix-Epoch, `Date` Tage seit
+//! 1970-01-01 und `Time` Mikrosekunden seit Mitternacht. `Decimal` speichert
+//! einen exakten Koeffizienten mit separater Skala; `Json` wird syntaktisch
+//! validiert und `Blob` als Bytes behandelt.
+//!
 //! Konstruktoren: [`DBCore::new`] (Name oder Pfad), [`DBCore::at`],
 //! [`DBCore::under`], [`DBCore::temp`] (Wegwerf-DB für Tests) und die
 //! `try_*`-Varianten mit echtem `Result`.
@@ -33,8 +47,10 @@
 //! * **Konsistent**: Constraints (Typ, `NOT NULL`, `UNIQUE`, `CHECK`,
 //!   Foreign Keys) werden bei jeder Änderung geprüft, jede Anweisung ist
 //!   für sich atomar.
-//! * **Isoliert**: Leser sehen immer einen abgeschlossenen Stand
-//!   (Snapshot-Isolation), nie halbfertige Transaktionen.
+//! * **Isoliert**: Leser und Schreiber arbeiten parallel auf unveränderlichen,
+//!   gepinnten Snapshots. Beim Commit werden alle gelesenen und geänderten
+//!   Tabellen optimistisch geprüft; widersprüchliche Änderungen liefern
+//!   [`DbError::WriteConflict`] statt fremde Writes zu überschreiben.
 //! * **Dauerhaft**: `fsync` von Datei *und* Verzeichnis (abschaltbar mit
 //!   [`DBCore::set_sync`]).
 //!
@@ -50,27 +66,36 @@
 //!
 //! ## 2. Crash-Sicherheit
 //! Jede Tabelle ist eine *unveränderliche* Datei (`name.<seq>.tbl`); ein
-//! Commit schreibt neue Dateien und schaltet sie mit **einem** atomaren
-//! `rename` der `MANIFEST`-Datei scharf. Stirbt der Prozess davor, bleibt der
-//! alte Stand vollständig erhalten; Reste werden beim nächsten Öffnen
-//! aufgeräumt. Jeder Block ist AEAD-authentifiziert (Prüfsumme + Manipulations-
-//! schutz, auch gegen Abschneiden/Umsortieren). Beschädigungen werden als
-//! [`DbError::Crypto`]/[`DbError::Corrupt`] gemeldet, nie still geschluckt.
+//! Commit schreibt neue Dateien, sichert den verschlüsselten Redo-Eintrag im
+//! `WAL` und schaltet ihn danach mit **einem** atomaren `rename` der
+//! `MANIFEST`-Datei scharf. Beim Öffnen wird ein vorhandenes WAL geprüft und
+//! nötigenfalls wiederholt; nach dem Commit wird es automatisch checkpointed.
+//! [`DBCore::checkpoint`] kann einen Checkpoint explizit erzwingen. Stirbt der
+//! Prozess vor dem WAL, bleibt der alte Stand erhalten; ein abgerissenes oder
+//! manipuliertes WAL wird als Fehler gemeldet. Jeder Block und das WAL sind
+//! AEAD-authentifiziert (Schutz auch gegen Abschneiden/Umsortieren).
+//! Nicht mehr referenzierte Tabellenversionen werden nach Commits eingesammelt;
+//! offene Snapshots bleiben durch ihre Datei-Handles weiterhin lesbar.
+//! Beschädigungen werden als [`DbError::Crypto`]/[`DbError::Corrupt`] gemeldet,
+//! nie still geschluckt.
 //! [`DBCore::integrity_check`] prüft die ganze Datenbank.
 //!
 //! ## 3. Nebenläufigkeit
 //! * [`DBCore`] ist `Clone + Send + Sync` – einfach pro Thread klonen.
 //! * **Beliebig viele Leser gleichzeitig** (Threads *und* Prozesse), ohne
 //!   Sperren und ohne von Schreibern blockiert zu werden.
-//! * **Mehrere Schreiber gleichzeitig**: Sie dürfen alle gleichzeitig
-//!   loslegen, werden aber (wie bei SQLite) nacheinander abgearbeitet –
-//!   Reihenfolge per Datei-Lock auch über Prozessgrenzen, nichts geht
-//!   verloren, nichts wird überschrieben. Wer zu lange warten muss, bekommt
-//!   [`DbError::Busy`] (Standard 10 s, [`DBCore::set_busy_timeout`]).
+//! * **Mehrere Schreiber gleichzeitig**: Transaktionen starten ohne
+//!   Schreib-Lock und bereiten Änderungen parallel vor. Nur der Commit wird
+//!   kurz per Datei-Lock serialisiert. Änderungen an gelesenen/geänderten
+//!   Tabellen seit dem Snapshot führen zu [`DbError::WriteConflict`];
+//!   unabhängige Tabellen können parallel geändert werden. Wer beim Commit
+//!   zu lange auf den Lock wartet, bekommt [`DbError::Busy`] (Standard 10 s,
+//!   [`DBCore::set_busy_timeout`]).
 //! * [`DBCore::snapshot`] liefert einen festen Stand über mehrere Tabellen.
 //!
 //! **Wichtig:** Innerhalb von `transaction(|tx| …)` immer `tx.…` benutzen,
-//! nicht `db.…` (das würde auf den eigenen Lock warten → `Busy`).
+//! nicht `db.…`: ein Aufruf über `db` läuft in einer unabhängigen Transaktion
+//! und kann einen Konflikt mit der äußeren Transaktion auslösen.
 //!
 //! ## 4. Fehlerbehandlung
 //! Alle Operationen haben eine `try_*`-Variante mit `Result<_, DbError>`.
@@ -94,8 +119,9 @@
 //!     .check("likes", Check::ge(0))
 //!     .references("author", "users", "id", OnDelete::Cascade));
 //! ```
-//! `NOT NULL` heißt hier „nicht leer“ (DBCore kennt kein NULL; typisierte
-//! Spalten können ohnehin nie leer sein).
+//! `NOT NULL` weist den expliziten [`Value::Null`] zurück. Ein leerer Textwert
+//! bleibt davon unterschieden; nullable Schemafelder können mit `Option<T>`
+//! abgebildet werden.
 //!
 //! ## 7. Typen
 //! * Beim Schreiben wird jeder Wert gegen den Spaltentyp geprüft.
@@ -156,24 +182,355 @@ pub(crate) const FORMAT_LINE: &str = "FORMAT:2";
 // ───────────── Spaltentypen ─────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColumnKind { Int, Float, Text, Bool }
+pub enum ColumnKind {
+    Null,
+    Int,
+    Float,
+    Text,
+    Bool,
+    Blob,
+    Timestamp,
+    Date,
+    Time,
+    Uuid,
+    Json,
+    Decimal,
+}
 
 impl ColumnKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            ColumnKind::Int   => "Int",
+            ColumnKind::Null => "Null",
+            ColumnKind::Int => "Int",
             ColumnKind::Float => "Float",
-            ColumnKind::Text  => "Text",
-            ColumnKind::Bool  => "Bool",
+            ColumnKind::Text => "Text",
+            ColumnKind::Bool => "Bool",
+            ColumnKind::Blob => "Blob",
+            ColumnKind::Timestamp => "Timestamp",
+            ColumnKind::Date => "Date",
+            ColumnKind::Time => "Time",
+            ColumnKind::Uuid => "Uuid",
+            ColumnKind::Json => "Json",
+            ColumnKind::Decimal => "Decimal",
         }
     }
-    pub(crate) fn from_str(s: &str) -> Self {
-        match s {
-            "Int"   => ColumnKind::Int,
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "Null" => ColumnKind::Null,
+            "Int" => ColumnKind::Int,
             "Float" => ColumnKind::Float,
-            "Bool"  => ColumnKind::Bool,
-            _       => ColumnKind::Text,
+            "Text" => ColumnKind::Text,
+            "Bool" => ColumnKind::Bool,
+            "Blob" => ColumnKind::Blob,
+            "Timestamp" => ColumnKind::Timestamp,
+            "Date" => ColumnKind::Date,
+            "Time" => ColumnKind::Time,
+            "Uuid" => ColumnKind::Uuid,
+            "Json" => ColumnKind::Json,
+            "Decimal" => ColumnKind::Decimal,
+            _ => return None,
+        })
+    }
+}
+
+/// Natively typed value accepted by the typed parameter APIs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Null,
+    Int(i128),
+    Float(f64),
+    Text(String),
+    Bool(bool),
+    Blob(Vec<u8>),
+    Timestamp(i64),
+    Date(i32),
+    Time(i64),
+    Uuid([u8; 16]),
+    Json(String),
+    Decimal { coefficient: i128, scale: u32 },
+}
+
+impl Value {
+    pub fn kind(&self) -> ColumnKind {
+        match self {
+            Value::Null => ColumnKind::Null,
+            Value::Int(_) => ColumnKind::Int,
+            Value::Float(_) => ColumnKind::Float,
+            Value::Text(_) => ColumnKind::Text,
+            Value::Bool(_) => ColumnKind::Bool,
+            Value::Blob(_) => ColumnKind::Blob,
+            Value::Timestamp(_) => ColumnKind::Timestamp,
+            Value::Date(_) => ColumnKind::Date,
+            Value::Time(_) => ColumnKind::Time,
+            Value::Uuid(_) => ColumnKind::Uuid,
+            Value::Json(_) => ColumnKind::Json,
+            Value::Decimal { .. } => ColumnKind::Decimal,
         }
+    }
+
+    fn as_input(&self) -> String {
+        match self {
+            Value::Null => NULL_CELL.to_string(),
+            Value::Int(v) => v.to_string(),
+            Value::Float(v) => v.to_string(),
+            Value::Text(v) | Value::Json(v) => v.clone(),
+            Value::Bool(v) => v.to_string(),
+            Value::Blob(v) => hex_encode(v),
+            Value::Timestamp(v) | Value::Time(v) => v.to_string(),
+            Value::Date(v) => v.to_string(),
+            Value::Uuid(v) => format_uuid(v),
+            Value::Decimal { coefficient, scale } => decimal_text(*coefficient, *scale),
+        }
+    }
+}
+
+macro_rules! value_from {
+    ($($ty:ty => $variant:ident),* $(,)?) => {$(
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self { Value::$variant(value.into()) }
+        }
+    )*};
+}
+value_from! {
+    i8 => Int, i16 => Int, i32 => Int, i64 => Int, i128 => Int,
+    u8 => Int, u16 => Int, u32 => Int, u64 => Int,
+    f32 => Float, f64 => Float,
+    bool => Bool,
+    String => Text,
+    Vec<u8> => Blob,
+}
+impl From<isize> for Value {
+    fn from(v: isize) -> Self {
+        Value::Int(v as i128)
+    }
+}
+impl From<usize> for Value {
+    fn from(v: usize) -> Self {
+        Value::Int(v as i128)
+    }
+}
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::Text(v.to_string())
+    }
+}
+impl From<&String> for Value {
+    fn from(v: &String) -> Self {
+        Value::Text(v.clone())
+    }
+}
+impl From<&[u8]> for Value {
+    fn from(v: &[u8]) -> Self {
+        Value::Blob(v.to_vec())
+    }
+}
+impl From<&Vec<u8>> for Value {
+    fn from(v: &Vec<u8>) -> Self {
+        Value::Blob(v.clone())
+    }
+}
+
+macro_rules! value_from_ref {
+    ($($ty:ty),* $(,)?) => {$(
+        impl From<&$ty> for Value {
+            fn from(v: &$ty) -> Self { Value::from(*v) }
+        }
+    )*};
+}
+value_from_ref!(i8, i16, i32, i64, i128, u8, u16, u32, u64, f32, f64, bool);
+impl From<&isize> for Value {
+    fn from(v: &isize) -> Self {
+        Value::from(*v)
+    }
+}
+impl From<&usize> for Value {
+    fn from(v: &usize) -> Self {
+        Value::from(*v)
+    }
+}
+impl<T: Clone + Into<Value>> From<&Option<T>> for Value {
+    fn from(v: &Option<T>) -> Self {
+        v.as_ref().cloned().map(Into::into).unwrap_or(Value::Null)
+    }
+}
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(v: Option<T>) -> Self {
+        v.map(Into::into).unwrap_or(Value::Null)
+    }
+}
+impl From<Blob> for Value {
+    fn from(v: Blob) -> Self {
+        Value::Blob(v.0)
+    }
+}
+impl From<&Blob> for Value {
+    fn from(v: &Blob) -> Self {
+        Value::Blob(v.0.clone())
+    }
+}
+impl From<Timestamp> for Value {
+    fn from(v: Timestamp) -> Self {
+        Value::Timestamp(v.0)
+    }
+}
+impl From<Date> for Value {
+    fn from(v: Date) -> Self {
+        Value::Date(v.0)
+    }
+}
+impl From<Time> for Value {
+    fn from(v: Time) -> Self {
+        Value::Time(v.0)
+    }
+}
+impl From<Uuid> for Value {
+    fn from(v: Uuid) -> Self {
+        Value::Uuid(v.0)
+    }
+}
+impl From<Json> for Value {
+    fn from(v: Json) -> Self {
+        Value::Json(v.0)
+    }
+}
+impl From<&Json> for Value {
+    fn from(v: &Json) -> Self {
+        Value::Json(v.0.clone())
+    }
+}
+impl From<Decimal> for Value {
+    fn from(v: Decimal) -> Self {
+        Value::Decimal {
+            coefficient: v.coefficient,
+            scale: v.scale,
+        }
+    }
+}
+
+const NULL_CELL: &str = "\u{0}";
+const TEXT_ESCAPE: &str = "\u{0}\u{0}";
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn format_uuid(bytes: &[u8; 16]) -> String {
+    let hex = hex_encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn decimal_text(coefficient: i128, scale: u32) -> String {
+    if scale > 38 {
+        return String::new();
+    }
+    let negative = coefficient < 0;
+    let digits = coefficient.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let mut out = if scale == 0 {
+        digits
+    } else if digits.len() <= scale {
+        format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+    } else {
+        format!(
+            "{}.{}",
+            &digits[..digits.len() - scale],
+            &digits[digits.len() - scale..]
+        )
+    };
+    if negative {
+        out.insert(0, '-');
+    }
+    out
+}
+
+/// Binary value marker type for [`schema!`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob(pub Vec<u8>);
+/// Unix-epoch timestamp in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timestamp(pub i64);
+/// Calendar day count relative to 1970-01-01.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Date(pub i32);
+/// Microseconds since midnight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Time(pub i64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Uuid(pub [u8; 16]);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Json(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decimal {
+    pub coefficient: i128,
+    pub scale: u32,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Null;
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if matches!(self, Value::Null) {
+            f.write_str("NULL")
+        } else {
+            f.write_str(&self.as_input())
+        }
+    }
+}
+
+impl fmt::Display for Blob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex_encode(&self.0))
+    }
+}
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl fmt::Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl fmt::Display for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl fmt::Display for Uuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&format_uuid(&self.0))
+    }
+}
+impl fmt::Display for Json {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl fmt::Display for Decimal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&decimal_text(self.coefficient, self.scale))
     }
 }
 
@@ -181,26 +538,45 @@ impl ColumnKind {
 
 /// Vergleichsoperator für [`Check`] und die `where_*`-Bedingungen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge }
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
 
 impl CmpOp {
     pub(crate) fn code(self) -> &'static str {
         match self {
-            CmpOp::Eq => "eq", CmpOp::Ne => "ne", CmpOp::Lt => "lt",
-            CmpOp::Le => "le", CmpOp::Gt => "gt", CmpOp::Ge => "ge",
+            CmpOp::Eq => "eq",
+            CmpOp::Ne => "ne",
+            CmpOp::Lt => "lt",
+            CmpOp::Le => "le",
+            CmpOp::Gt => "gt",
+            CmpOp::Ge => "ge",
         }
     }
     pub(crate) fn from_code(s: &str) -> Option<Self> {
         Some(match s {
-            "eq" => CmpOp::Eq, "ne" => CmpOp::Ne, "lt" => CmpOp::Lt,
-            "le" => CmpOp::Le, "gt" => CmpOp::Gt, "ge" => CmpOp::Ge,
+            "eq" => CmpOp::Eq,
+            "ne" => CmpOp::Ne,
+            "lt" => CmpOp::Lt,
+            "le" => CmpOp::Le,
+            "gt" => CmpOp::Gt,
+            "ge" => CmpOp::Ge,
             _ => return None,
         })
     }
     pub(crate) fn symbol(self) -> &'static str {
         match self {
-            CmpOp::Eq => "=", CmpOp::Ne => "!=", CmpOp::Lt => "<",
-            CmpOp::Le => "<=", CmpOp::Gt => ">", CmpOp::Ge => ">=",
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
         }
     }
     pub(crate) fn holds(self, o: Ordering) -> bool {
@@ -236,30 +612,51 @@ pub enum Check {
 }
 
 impl Check {
-    pub fn eq(v: impl ToString) -> Self { Check::Cmp(CmpOp::Eq, v.to_string()) }
-    pub fn ne(v: impl ToString) -> Self { Check::Cmp(CmpOp::Ne, v.to_string()) }
-    pub fn lt(v: impl ToString) -> Self { Check::Cmp(CmpOp::Lt, v.to_string()) }
-    pub fn le(v: impl ToString) -> Self { Check::Cmp(CmpOp::Le, v.to_string()) }
-    pub fn gt(v: impl ToString) -> Self { Check::Cmp(CmpOp::Gt, v.to_string()) }
-    pub fn ge(v: impl ToString) -> Self { Check::Cmp(CmpOp::Ge, v.to_string()) }
+    pub fn eq(v: impl ToString) -> Self {
+        Check::Cmp(CmpOp::Eq, v.to_string())
+    }
+    pub fn ne(v: impl ToString) -> Self {
+        Check::Cmp(CmpOp::Ne, v.to_string())
+    }
+    pub fn lt(v: impl ToString) -> Self {
+        Check::Cmp(CmpOp::Lt, v.to_string())
+    }
+    pub fn le(v: impl ToString) -> Self {
+        Check::Cmp(CmpOp::Le, v.to_string())
+    }
+    pub fn gt(v: impl ToString) -> Self {
+        Check::Cmp(CmpOp::Gt, v.to_string())
+    }
+    pub fn ge(v: impl ToString) -> Self {
+        Check::Cmp(CmpOp::Ge, v.to_string())
+    }
     pub fn between(lo: impl ToString, hi: impl ToString) -> Self {
         Check::Between(lo.to_string(), hi.to_string())
     }
     pub fn one_of<I, S>(items: I) -> Self
-    where I: IntoIterator<Item = S>, S: ToString {
+    where
+        I: IntoIterator<Item = S>,
+        S: ToString,
+    {
         Check::OneOf(items.into_iter().map(|s| s.to_string()).collect())
     }
-    pub fn len(min: usize, max: usize) -> Self { Check::Len { min, max } }
-    pub fn like(pattern: impl ToString) -> Self { Check::Like(pattern.to_string()) }
+    pub fn len(min: usize, max: usize) -> Self {
+        Check::Len { min, max }
+    }
+    pub fn like(pattern: impl ToString) -> Self {
+        Check::Like(pattern.to_string())
+    }
 
     pub(crate) fn holds(&self, kind: ColumnKind, v: &str) -> bool {
         match self {
             Check::Cmp(op, rhs) => op.holds(cmp_values(kind, v, rhs)),
-            Check::Between(lo, hi) =>
+            Check::Between(lo, hi) => {
                 cmp_values(kind, v, lo) != Ordering::Less
-                && cmp_values(kind, v, hi) != Ordering::Greater,
-            Check::OneOf(items) =>
-                items.iter().any(|i| cmp_values(kind, v, i) == Ordering::Equal),
+                    && cmp_values(kind, v, hi) != Ordering::Greater
+            }
+            Check::OneOf(items) => items
+                .iter()
+                .any(|i| cmp_values(kind, v, i) == Ordering::Equal),
             Check::Len { min, max } => {
                 let n = v.chars().count();
                 n >= *min && n <= *max
@@ -309,7 +706,10 @@ impl Check {
             "cmp" => Check::Cmp(CmpOp::from_code(t.get(1)?)?, t.get(2)?.clone()),
             "between" => Check::Between(t.get(1)?.clone(), t.get(2)?.clone()),
             "in" => Check::OneOf(t[1..].to_vec()),
-            "len" => Check::Len { min: t.get(1)?.parse().ok()?, max: t.get(2)?.parse().ok()? },
+            "len" => Check::Len {
+                min: t.get(1)?.parse().ok()?,
+                max: t.get(2)?.parse().ok()?,
+            },
             "like" => Check::Like(t.get(1)?.clone()),
             _ => return None,
         })
@@ -324,16 +724,23 @@ pub(crate) fn like_match(pattern: &str, text: &str) -> bool {
     let (mut star, mut mark) = (None::<usize>, 0usize);
     while ti < t.len() {
         if pi < p.len() && (p[pi] == '_' || (p[pi] != '%' && p[pi] == t[ti])) {
-            pi += 1; ti += 1;
+            pi += 1;
+            ti += 1;
         } else if pi < p.len() && p[pi] == '%' {
-            star = Some(pi); mark = ti; pi += 1;
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
         } else if let Some(s) = star {
-            pi = s + 1; mark += 1; ti = mark;
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
         } else {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '%' { pi += 1; }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
     pi == p.len()
 }
 
@@ -380,35 +787,81 @@ impl ColumnDef {
         key: bool,
     ) -> Self {
         ColumnDef {
-            name: name.into(), kind, default, key,
-            not_null: false, unique: false, indexed: false,
-            checks: Vec::new(), fk: None,
+            name: name.into(),
+            kind,
+            default,
+            key,
+            not_null: false,
+            unique: false,
+            indexed: false,
+            checks: Vec::new(),
+            fk: None,
         }
     }
-    pub fn name(&self) -> &str { &self.name }
-    pub fn kind(&self) -> ColumnKind { self.kind }
-    pub fn default_value(&self) -> Option<&str> { self.default.as_deref() }
-    pub fn is_key(&self) -> bool { self.key }
-    pub fn is_not_null(&self) -> bool { self.not_null }
-    pub fn is_unique(&self) -> bool { self.unique || self.key }
-    pub fn is_indexed(&self) -> bool { self.indexed || self.unique || self.key }
-    pub fn checks(&self) -> &[Check] { &self.checks }
-    pub fn foreign_key(&self) -> Option<&ForeignKey> { self.fk.as_ref() }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn kind(&self) -> ColumnKind {
+        self.kind
+    }
+    pub fn default_value(&self) -> Option<&str> {
+        self.default.as_deref().filter(|v| *v != NULL_CELL)
+    }
+    pub fn is_key(&self) -> bool {
+        self.key
+    }
+    pub fn is_not_null(&self) -> bool {
+        self.not_null
+    }
+    pub fn is_unique(&self) -> bool {
+        self.unique || self.key
+    }
+    pub fn is_indexed(&self) -> bool {
+        self.indexed || self.unique || self.key
+    }
+    pub fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+    pub fn foreign_key(&self) -> Option<&ForeignKey> {
+        self.fk.as_ref()
+    }
 
     /// Builder: Spalte darf nicht leer sein.
-    pub fn not_null(mut self) -> Self { self.not_null = true; self }
-    pub fn unique(mut self) -> Self { self.unique = true; self }
-    pub fn indexed(mut self) -> Self { self.indexed = true; self }
-    pub fn with_check(mut self, c: Check) -> Self { self.checks.push(c); self }
+    pub fn not_null(mut self) -> Self {
+        self.not_null = true;
+        self
+    }
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+    pub fn indexed(mut self) -> Self {
+        self.indexed = true;
+        self
+    }
+    pub fn with_check(mut self, c: Check) -> Self {
+        self.checks.push(c);
+        self
+    }
     pub fn with_reference(
-        mut self, table: impl Into<String>, column: impl Into<String>, on_delete: OnDelete,
+        mut self,
+        table: impl Into<String>,
+        column: impl Into<String>,
+        on_delete: OnDelete,
     ) -> Self {
-        self.fk = Some(ForeignKey { table: table.into(), column: column.into(), on_delete });
+        self.fk = Some(ForeignKey {
+            table: table.into(),
+            column: column.into(),
+            on_delete,
+        });
         self
     }
 }
 
-pub trait ColumnType { fn kind() -> ColumnKind; }
+pub trait ColumnType {
+    fn kind() -> ColumnKind;
+    fn nullable() -> bool { false }
+}
 
 macro_rules! impl_column_type {
     ($($t:ty => $k:ident),* $(,)?) => {
@@ -421,6 +874,14 @@ impl_column_type! {
     u8 => Int, u16 => Int, u32 => Int, u64 => Int, usize => Int,
     f32 => Float, f64 => Float,
     bool => Bool,
+    Blob => Blob, Timestamp => Timestamp, Date => Date, Time => Time,
+    Uuid => Uuid, Json => Json, Decimal => Decimal, Null => Null,
+}
+impl<T: ColumnType> ColumnType for Option<T> {
+    fn kind() -> ColumnKind {
+        T::kind()
+    }
+    fn nullable() -> bool { true }
 }
 
 // ───────────── Schema ─────────────
@@ -433,8 +894,15 @@ pub struct Schema {
 }
 
 impl Schema {
-    pub fn new(columns: Vec<ColumnDef>) -> Self { Schema { columns, problems: Vec::new() } }
-    pub fn columns(&self) -> &[ColumnDef] { &self.columns }
+    pub fn new(columns: Vec<ColumnDef>) -> Self {
+        Schema {
+            columns,
+            problems: Vec::new(),
+        }
+    }
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
 
     fn on<F: FnOnce(&mut ColumnDef)>(mut self, col: &str, f: F) -> Self {
         match self.columns.iter_mut().find(|c| c.name == col) {
@@ -446,17 +914,23 @@ impl Schema {
 
     /// Spalten dürfen nicht leer sein.
     pub fn not_null(mut self, cols: &[&str]) -> Self {
-        for c in cols { self = self.on(c, |c| c.not_null = true); }
+        for c in cols {
+            self = self.on(c, |c| c.not_null = true);
+        }
         self
     }
     /// `UNIQUE` (erzeugt zugleich einen Index).
     pub fn unique(mut self, cols: &[&str]) -> Self {
-        for c in cols { self = self.on(c, |c| c.unique = true); }
+        for c in cols {
+            self = self.on(c, |c| c.unique = true);
+        }
         self
     }
     /// Sekundärer Index (nicht eindeutig).
     pub fn index(mut self, cols: &[&str]) -> Self {
-        for c in cols { self = self.on(c, |c| c.indexed = true); }
+        for c in cols {
+            self = self.on(c, |c| c.indexed = true);
+        }
         self
     }
     /// `CHECK`-Bedingung für eine Spalte (mehrfach aufrufbar).
@@ -464,11 +938,15 @@ impl Schema {
         self.on(col, |c| c.checks.push(check))
     }
     /// Foreign Key: `col` verweist auf `table.column`.
-    pub fn references(
-        self, col: &str, table: &str, column: &str, on_delete: OnDelete,
-    ) -> Self {
+    pub fn references(self, col: &str, table: &str, column: &str, on_delete: OnDelete) -> Self {
         let (t, cc) = (table.to_string(), column.to_string());
-        self.on(col, |c| c.fk = Some(ForeignKey { table: t, column: cc, on_delete }))
+        self.on(col, |c| {
+            c.fk = Some(ForeignKey {
+                table: t,
+                column: cc,
+                on_delete,
+            })
+        })
     }
 }
 
@@ -498,6 +976,9 @@ macro_rules! schema {
                                 ::std::format!("{}", $default)
                             );
                         )?
+                        if d.is_none() && <$ty as $crate::ColumnType>::nullable() {
+                            d = ::std::option::Option::Some(::std::string::String::from("\0"));
+                        }
                         d
                     },
                     $crate::__dbcore_is_key_marker!($( $key_marker )?),
@@ -510,8 +991,12 @@ macro_rules! schema {
 #[macro_export]
 #[doc(hidden)]
 macro_rules! __dbcore_is_key_marker {
-    (key) => { true };
-    ()    => { false };
+    (key) => {
+        true
+    };
+    () => {
+        false
+    };
 }
 
 /// `row! { id: 1, name: "Alice" }` → `Vec<(&str, String)>`.
@@ -523,6 +1008,18 @@ macro_rules! row {
         ::std::vec![
             $(
                 (::std::stringify!($name), ::std::format!("{}", $val))
+            ),*
+        ]
+    };
+}
+
+/// `params! { id: 1, note: Value::Null }` creates native, typed parameters.
+#[macro_export]
+macro_rules! params {
+    ($($name:ident : $val:expr),* $(,)?) => {
+        ::std::vec![
+            $(
+                (::std::stringify!($name), $crate::Value::from($val))
             ),*
         ]
     };
@@ -599,7 +1096,21 @@ macro_rules! model {
                 $crate::schema! { $( $(@ $km)? $f : $t $(= $d)? ),* }
             }
             fn to_values(&self) -> ::std::vec::Vec<(&'static str, ::std::string::String)> {
-                ::std::vec![ $( (::std::stringify!($f), ::std::format!("{}", self.$f)) ),* ]
+                ::std::vec![
+                    $(
+                        (
+                            ::std::stringify!($f),
+                            ::std::string::ToString::to_string(&$crate::Value::from(&self.$f)),
+                        )
+                    ),*
+                ]
+            }
+            fn to_typed_values(&self) -> ::std::vec::Vec<(&'static str, $crate::Value)> {
+                ::std::vec![
+                    $(
+                        (::std::stringify!($f), $crate::Value::from(&self.$f))
+                    ),*
+                ]
             }
         }
     };
@@ -622,8 +1133,10 @@ pub enum DbError {
     TypeMismatch(String),
     DuplicateKey(String),
     BadValue(String),
-    /// Schreib-Lock nicht rechtzeitig erhalten (anderer Schreiber ist zu lange aktiv).
+    /// Schreib-Lock beim Commit nicht rechtzeitig erhalten.
     Busy,
+    /// Eine gelesene oder geänderte Tabelle hat sich seit Transaktionsbeginn geändert.
+    WriteConflict(String),
     /// `NOT NULL` verletzt.
     NotNull(String),
     /// `UNIQUE` verletzt.
@@ -645,34 +1158,45 @@ pub enum DbError {
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DbError::Io(e)             => write!(f, "I/O-Fehler: {e}"),
-            DbError::Crypto(m)         => write!(f, "Krypto-Fehler: {m}"),
-            DbError::Corrupt(m)        => write!(f, "Beschädigte Datei: {m}"),
-            DbError::InvalidName       => write!(f, "Ungültiger Name (erlaubt: a-z A-Z 0-9 _ -)"),
-            DbError::TableExists(n)    => write!(f, "Tabelle '{n}' existiert bereits"),
-            DbError::TableNotFound(n)  => write!(f, "Tabelle '{n}' nicht gefunden"),
-            DbError::RowNotFound(m)    => write!(f, "Zeile nicht gefunden: {m}"),
-            DbError::Closed            => write!(f, "Datenbank ist nicht geöffnet"),
+            DbError::Io(e) => write!(f, "I/O-Fehler: {e}"),
+            DbError::Crypto(m) => write!(f, "Krypto-Fehler: {m}"),
+            DbError::Corrupt(m) => write!(f, "Beschädigte Datei: {m}"),
+            DbError::InvalidName => write!(f, "Ungültiger Name (erlaubt: a-z A-Z 0-9 _ -)"),
+            DbError::TableExists(n) => write!(f, "Tabelle '{n}' existiert bereits"),
+            DbError::TableNotFound(n) => write!(f, "Tabelle '{n}' nicht gefunden"),
+            DbError::RowNotFound(m) => write!(f, "Zeile nicht gefunden: {m}"),
+            DbError::Closed => write!(f, "Datenbank ist nicht geöffnet"),
             DbError::SchemaMismatch(n) => write!(f, "Schema-Verstoß: {n}"),
-            DbError::TypeMismatch(n)   => write!(f, "Typfehler: {n}"),
-            DbError::DuplicateKey(k)   => write!(f, "Schlüssel '{k}' existiert bereits"),
-            DbError::BadValue(n)       => write!(f, "Default von '{n}' enthält unerlaubte Zeichen (: , Zeilenumbruch)"),
-            DbError::Busy              => write!(f, "Datenbank ist beschäftigt (Schreib-Lock-Timeout)"),
-            DbError::NotNull(c)        => write!(f, "NOT NULL verletzt: Spalte '{c}' darf nicht leer sein"),
-            DbError::Unique(m)         => write!(f, "UNIQUE verletzt: {m}"),
-            DbError::CheckFailed(m)    => write!(f, "CHECK verletzt: {m}"),
-            DbError::ForeignKey(m)     => write!(f, "Foreign-Key-Verstoß: {m}"),
-            DbError::ReadOnly          => write!(f, "Nur lesbar (Snapshot oder beendete Transaktion)"),
-            DbError::SnapshotExpired   => write!(f, "Snapshot veraltet – bitte neuen Snapshot holen"),
-            DbError::TxState(m)        => write!(f, "Transaktionsfehler: {m}"),
-            DbError::Unsupported(m)    => write!(f, "Nicht unterstützt: {m}"),
+            DbError::TypeMismatch(n) => write!(f, "Typfehler: {n}"),
+            DbError::DuplicateKey(k) => write!(f, "Schlüssel '{k}' existiert bereits"),
+            DbError::BadValue(n) => write!(
+                f,
+                "Default von '{n}' enthält unerlaubte Zeichen (: , Zeilenumbruch)"
+            ),
+            DbError::Busy => write!(f, "Datenbank ist beschäftigt (Schreib-Lock-Timeout)"),
+            DbError::WriteConflict(t) => write!(
+                f,
+                "Schreibkonflikt: '{t}' wurde seit Transaktionsbeginn geändert"
+            ),
+            DbError::NotNull(c) => {
+                write!(f, "NOT NULL verletzt: Spalte '{c}' darf nicht leer sein")
+            }
+            DbError::Unique(m) => write!(f, "UNIQUE verletzt: {m}"),
+            DbError::CheckFailed(m) => write!(f, "CHECK verletzt: {m}"),
+            DbError::ForeignKey(m) => write!(f, "Foreign-Key-Verstoß: {m}"),
+            DbError::ReadOnly => write!(f, "Nur lesbar (Snapshot oder beendete Transaktion)"),
+            DbError::SnapshotExpired => write!(f, "Snapshot veraltet – bitte neuen Snapshot holen"),
+            DbError::TxState(m) => write!(f, "Transaktionsfehler: {m}"),
+            DbError::Unsupported(m) => write!(f, "Nicht unterstützt: {m}"),
         }
     }
 }
 
 impl error::Error for DbError {}
 impl From<io::Error> for DbError {
-    fn from(e: io::Error) -> Self { DbError::Io(e) }
+    fn from(e: io::Error) -> Self {
+        DbError::Io(e)
+    }
 }
 
 pub(crate) type Result<T> = std::result::Result<T, DbError>;
@@ -683,7 +1207,10 @@ pub type DbResult<T> = std::result::Result<T, DbError>;
 pub(crate) fn report<T>(r: Result<T>) -> Option<T> {
     match r {
         Ok(v) => Some(v),
-        Err(e) => { eprintln!("DBCore: {e}"); None }
+        Err(e) => {
+            eprintln!("DBCore: {e}");
+            None
+        }
     }
 }
 
@@ -692,20 +1219,200 @@ pub(crate) fn report<T>(r: Result<T>) -> Option<T> {
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn looks_like_path(s: &str) -> bool {
-    !s.is_empty() && (
-        s.contains('/') || s.contains('\\')
-        || s.starts_with('.')
-        || Path::new(s).is_absolute()
-    )
+    !s.is_empty()
+        && (s.contains('/') || s.contains('\\') || s.starts_with('.') || Path::new(s).is_absolute())
 }
 
 /// Zelle `i` einer Zeile; fehlende Zelle = "".
 pub(crate) fn cell(row: &[String], i: usize) -> &str {
     row.get(i).map(String::as_str).unwrap_or("")
+}
+
+pub(crate) fn is_null(row: &[String], i: usize) -> bool {
+    cell(row, i) == NULL_CELL
+}
+
+pub(crate) fn display_value(raw: &str) -> &str {
+    if raw == NULL_CELL {
+        ""
+    } else if raw.starts_with(TEXT_ESCAPE) {
+        &raw[1..]
+    } else {
+        raw
+    }
+}
+
+pub(crate) fn display_row(schema: &[ColDef], row: &[String]) -> Vec<String> {
+    schema
+        .iter()
+        .enumerate()
+        .map(|(i, _)| display_value(cell(row, i)).to_string())
+        .collect()
+}
+
+fn valid_uuid(s: &str) -> bool {
+    let bytes: String = s.chars().filter(|&c| c != '-').collect();
+    s.len() == 36
+        && s.as_bytes().get(8) == Some(&b'-')
+        && s.as_bytes().get(13) == Some(&b'-')
+        && s.as_bytes().get(18) == Some(&b'-')
+        && s.as_bytes().get(23) == Some(&b'-')
+        && bytes.len() == 32
+        && bytes.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn parse_uuid(s: &str) -> Option<[u8; 16]> {
+    if !valid_uuid(s) {
+        return None;
+    }
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    let bytes = hex_decode(&hex)?;
+    bytes.try_into().ok()
+}
+
+fn valid_decimal(s: &str) -> bool {
+    let unsigned = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    let mut parts = unsigned.split('.');
+    let whole = parts.next().unwrap_or("");
+    let fraction = parts.next();
+    !whole.is_empty()
+        && whole.len() <= 39
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.map_or(true, |p| {
+            p.len() <= 38 && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+        })
+        && parts.next().is_none()
+}
+
+pub(crate) fn canonical_decimal(s: &str) -> Option<String> {
+    if !valid_decimal(s) || parse_decimal(s).is_none() {
+        return None;
+    }
+    let negative = s.starts_with('-');
+    let unsigned = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fraction.trim_end_matches('0');
+    let zero = whole == "0" && fraction.is_empty();
+    Some(format!(
+        "{}{}{}{}",
+        if negative && !zero { "-" } else { "" },
+        whole,
+        if fraction.is_empty() { "" } else { "." },
+        fraction
+    ))
+}
+
+pub(crate) fn decimal_order_key(s: &str) -> Option<String> {
+    let canonical = canonical_decimal(s)?;
+    let negative = canonical.starts_with('-');
+    let unsigned = canonical.strip_prefix('-').unwrap_or(&canonical);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let len = whole.len();
+    let mut out = String::with_capacity(80);
+    out.push(if negative { '0' } else { '1' });
+    if negative {
+        out.push(char::from(b'9' - (len as u8 / 10)));
+        out.push(char::from(b'9' - (len as u8 % 10)));
+        out.extend(whole.bytes().map(|b| char::from(b'9' - (b - b'0'))));
+        out.extend(fraction.bytes().map(|b| char::from(b'9' - (b - b'0'))));
+        out.extend(std::iter::repeat('9').take(38usize.saturating_sub(fraction.len())));
+    } else {
+        out.push(char::from(b'0' + (len as u8 / 10)));
+        out.push(char::from(b'0' + (len as u8 % 10)));
+        out.push_str(whole);
+        out.extend(fraction.bytes().map(char::from));
+        out.extend(std::iter::repeat('0').take(38usize.saturating_sub(fraction.len())));
+    }
+    Some(out)
+}
+
+fn parse_decimal(s: &str) -> Option<(i128, u32)> {
+    if !valid_decimal(s) {
+        return None;
+    }
+    let negative = s.starts_with('-');
+    let unsigned = s
+        .strip_prefix('-')
+        .or_else(|| s.strip_prefix('+'))
+        .unwrap_or(s);
+    let mut parts = unsigned.split('.');
+    let whole = parts.next()?;
+    let fraction = parts.next().unwrap_or("");
+    let digits = format!("{whole}{fraction}");
+    let magnitude = digits.parse::<i128>().ok()?;
+    let coefficient = if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
+    Some((coefficient, u32::try_from(fraction.len()).ok()?))
+}
+
+fn typed_values<'a>(
+    schema: &[ColDef],
+    values: Vec<(&'a str, Value)>,
+) -> Result<Vec<(&'a str, String)>> {
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            let col = schema
+                .iter()
+                .find(|c| c.name == name)
+                .ok_or_else(|| unknown_col(name))?;
+            if !matches!(&value, Value::Null) && value.kind() != col.kind {
+                return Err(DbError::TypeMismatch(format!(
+                    "Spalte '{}' erwartet {}, bekam {}",
+                    col.name,
+                    col.kind.as_str(),
+                    value.kind().as_str()
+                )));
+            }
+            let raw = value.as_input();
+            let raw = if matches!(&value, Value::Text(_)) && raw.starts_with(NULL_CELL) {
+                format!("{NULL_CELL}{raw}")
+            } else {
+                raw
+            };
+            if !matches!(&value, Value::Null) {
+                validate_value(col, &raw)?;
+            }
+            Ok((name, raw))
+        })
+        .collect()
+}
+
+pub(crate) fn escape_text_fields<'a>(
+    schema: &[ColDef],
+    values: Vec<(&'a str, String)>,
+) -> Vec<(&'a str, String)> {
+    values
+        .into_iter()
+        .map(|(name, mut value)| {
+            if schema
+                .iter()
+                .any(|c| c.name == name && c.kind == ColumnKind::Text)
+                && value != NULL_CELL
+                && value.starts_with(NULL_CELL)
+            {
+                value.insert(0, '\0');
+            }
+            (name, value)
+        })
+        .collect()
 }
 
 pub(crate) fn unknown_col(c: &str) -> DbError {
@@ -718,20 +1425,28 @@ pub(crate) fn key_index(schema: &[ColDef]) -> Option<usize> {
 
 /// Spalten, die eindeutig sein müssen (`@key` + `UNIQUE`).
 pub(crate) fn unique_cols(schema: &[ColDef]) -> Vec<usize> {
-    schema.iter().enumerate().filter(|(_, c)| c.key || c.unique).map(|(i, _)| i).collect()
+    schema
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.key || c.unique)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Kanonische Form für Vergleiche/Hash-Keys ("01" == "1", "1.0" == "1").
 pub(crate) fn norm_val(kind: ColumnKind, v: &str) -> String {
     match kind {
-        ColumnKind::Int => match v.parse::<i128>() {
-            Ok(n) => n.to_string(),
-            Err(_) => v.to_string(),
-        },
+        ColumnKind::Int | ColumnKind::Timestamp | ColumnKind::Date | ColumnKind::Time => v
+            .parse::<i128>()
+            .map(|n| n.to_string())
+            .or_else(|_| v.parse::<u128>().map(|n| n.to_string()))
+            .unwrap_or_else(|_| v.to_string()),
         ColumnKind::Float => match v.parse::<f64>() {
             Ok(f) if f.is_finite() => f.to_string(),
             _ => v.to_string(),
         },
+        ColumnKind::Decimal => canonical_decimal(v).unwrap_or_else(|| v.to_string()),
+        ColumnKind::Blob | ColumnKind::Uuid => v.to_ascii_lowercase(),
         _ => v.to_string(),
     }
 }
@@ -743,14 +1458,30 @@ pub(crate) fn key_eq(kind: ColumnKind, a: &str, b: &str) -> bool {
 /// Prüft den Wert gegen den Spaltentyp.
 pub(crate) fn validate_value(c: &ColDef, v: &str) -> Result<()> {
     let ok = match c.kind {
-        ColumnKind::Int   => v.parse::<i64>().is_ok() || v.parse::<u64>().is_ok(),
+        ColumnKind::Null => false,
+        ColumnKind::Int => v.parse::<i128>().is_ok() || v.parse::<u128>().is_ok(),
         ColumnKind::Float => v.parse::<f64>().map(|f| f.is_finite()).unwrap_or(false),
-        ColumnKind::Bool  => v == "true" || v == "false",
-        ColumnKind::Text  => true,
+        ColumnKind::Bool => v == "true" || v == "false",
+        ColumnKind::Text => true,
+        ColumnKind::Blob => hex_decode(v).is_some(),
+        ColumnKind::Timestamp => v.parse::<i64>().is_ok(),
+        ColumnKind::Date => v.parse::<i32>().is_ok(),
+        ColumnKind::Time => v
+            .parse::<i64>()
+            .map(|n| (0..86_400_000_000).contains(&n))
+            .unwrap_or(false),
+        ColumnKind::Uuid => valid_uuid(v),
+        ColumnKind::Json => serde_json::from_str::<serde_json::Value>(v).is_ok(),
+        ColumnKind::Decimal => parse_decimal(v).is_some(),
     };
-    if ok { Ok(()) } else {
+    if ok {
+        Ok(())
+    } else {
         Err(DbError::TypeMismatch(format!(
-            "Spalte '{}' erwartet {}, bekam '{}'", c.name, c.kind.as_str(), v
+            "Spalte '{}' erwartet {}, bekam '{}'",
+            c.name,
+            c.kind.as_str(),
+            v
         )))
     }
 }
@@ -759,12 +1490,20 @@ pub(crate) fn validate_value(c: &ColDef, v: &str) -> Result<()> {
 pub(crate) fn check_row_local(schema: &[ColDef], row: &[String]) -> Result<()> {
     for (i, c) in schema.iter().enumerate() {
         let v = cell(row, i);
-        if c.not_null && v.is_empty() { return Err(DbError::NotNull(c.name.clone())); }
-        if v.is_empty() && c.kind == ColumnKind::Text { continue; }
+        let null = is_null(row, i);
+        if (c.not_null || c.key) && null {
+            return Err(DbError::NotNull(c.name.clone()));
+        }
+        if null {
+            continue;
+        }
         for ck in &c.checks {
             if !ck.holds(c.kind, v) {
                 return Err(DbError::CheckFailed(format!(
-                    "Spalte '{}' = '{}' muss {} sein", c.name, v, ck.describe()
+                    "Spalte '{}' = '{}' muss {} sein",
+                    c.name,
+                    v,
+                    ck.describe()
                 )));
             }
         }
@@ -775,17 +1514,25 @@ pub(crate) fn check_row_local(schema: &[ColDef], row: &[String]) -> Result<()> {
 /// Totale Ordnung: parsebare Zahlen vor Unparsebarem, sonst Text.
 pub(crate) fn cmp_values(kind: ColumnKind, a: &str, b: &str) -> Ordering {
     match kind {
-        ColumnKind::Int => match (a.parse::<i128>().ok(), b.parse::<i128>().ok()) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None)    => Ordering::Less,
-            (None, Some(_))    => Ordering::Greater,
-            (None, None)       => a.cmp(b),
-        },
+        ColumnKind::Int | ColumnKind::Timestamp | ColumnKind::Date | ColumnKind::Time => {
+            match (a.parse::<i128>().ok(), b.parse::<i128>().ok()) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        }
         ColumnKind::Float => match (a.parse::<f64>().ok(), b.parse::<f64>().ok()) {
             (Some(x), Some(y)) => x.total_cmp(&y),
-            (Some(_), None)    => Ordering::Less,
-            (None, Some(_))    => Ordering::Greater,
-            (None, None)       => a.cmp(b),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
+        },
+        ColumnKind::Decimal => match (decimal_order_key(a), decimal_order_key(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
         },
         _ => a.cmp(b),
     }
@@ -794,13 +1541,20 @@ pub(crate) fn cmp_values(kind: ColumnKind, a: &str, b: &str) -> Ordering {
 /// Spalte per Name finden: exakt, `tabelle.spalte` (einfache Tabelle)
 /// oder eindeutiges Suffix `.spalte` (Join-Ergebnis).
 pub(crate) fn find_col(schema: &[ColDef], name: &str) -> Option<usize> {
-    if let Some(i) = schema.iter().position(|c| c.name == name) { return Some(i); }
+    if let Some(i) = schema.iter().position(|c| c.name == name) {
+        return Some(i);
+    }
     if let Some((_, rest)) = name.split_once('.') {
-        if let Some(i) = schema.iter().position(|c| c.name == rest) { return Some(i); }
+        if let Some(i) = schema.iter().position(|c| c.name == rest) {
+            return Some(i);
+        }
         return None;
     }
     let suffix = format!(".{name}");
-    let mut hits = schema.iter().enumerate().filter(|(_, c)| c.name.ends_with(&suffix));
+    let mut hits = schema
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name.ends_with(&suffix));
     match (hits.next(), hits.next()) {
         (Some((i, _)), None) => Some(i),
         _ => None,
@@ -809,26 +1563,48 @@ pub(crate) fn find_col(schema: &[ColDef], name: &str) -> Option<usize> {
 
 pub(crate) fn resolve_col(schema: &[ColDef], name: &str) -> Result<usize> {
     find_col(schema, name).ok_or_else(|| {
-        let ambiguous = !name.contains('.') && schema.iter()
-            .filter(|c| c.name.ends_with(&format!(".{name}"))).count() > 1;
+        let ambiguous = !name.contains('.')
+            && schema
+                .iter()
+                .filter(|c| c.name.ends_with(&format!(".{name}")))
+                .count()
+                > 1;
         if ambiguous {
-            DbError::SchemaMismatch(format!("Spalte '{name}' ist mehrdeutig – 'tabelle.{name}' verwenden"))
-        } else { unknown_col(name) }
+            DbError::SchemaMismatch(format!(
+                "Spalte '{name}' ist mehrdeutig – 'tabelle.{name}' verwenden"
+            ))
+        } else {
+            unknown_col(name)
+        }
     })
 }
 
 pub(crate) fn build_row(schema: &[ColDef], values: &[(&str, String)]) -> Result<Vec<String>> {
     for (k, _) in values {
-        if !schema.iter().any(|c| c.name == *k) { return Err(unknown_col(k)); }
+        if !schema.iter().any(|c| c.name == *k) {
+            return Err(unknown_col(k));
+        }
     }
     let mut row = Vec::with_capacity(schema.len());
     for c in schema {
-        let v = match values.iter().find(|p| p.0 == c.name.as_str()) {
+        let mut v = match values.iter().find(|p| p.0 == c.name.as_str()) {
             Some(p) => p.1.clone(),
-            None => c.default.clone()
+            None => c
+                .default
+                .clone()
                 .ok_or_else(|| DbError::SchemaMismatch(format!("Spalte '{}' fehlt", c.name)))?,
         };
-        validate_value(c, &v)?;
+        if v == NULL_CELL {
+            if c.not_null || c.key {
+                return Err(DbError::NotNull(c.name.clone()));
+            }
+        } else {
+            validate_value(c, &v)?;
+            if c.kind == ColumnKind::Text && v.starts_with(NULL_CELL) && !v.starts_with(TEXT_ESCAPE)
+            {
+                v.insert(0, '\0');
+            }
+        }
         row.push(v);
     }
     Ok(row)
@@ -840,23 +1616,40 @@ static EMPTY: String = String::new();
 
 /// Eine Ergebniszeile mit Schema. Zugriff nach Position (`r[2]`), Name
 /// (`r["views"]`) oder typisiert (`r.get::<i64>("views")`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Row<'a> {
     pub(crate) schema: &'a [ColDef],
-    pub(crate) cells: &'a [String],
+    cells: Vec<String>,
+    raw: Vec<String>,
 }
 
 impl<'a> Row<'a> {
-    pub(crate) fn new(schema: &'a [ColDef], cells: &'a [String]) -> Self { Row { schema, cells } }
-    pub fn len(&self) -> usize { self.cells.len() }
-    pub fn is_empty(&self) -> bool { self.cells.is_empty() }
-    pub fn cells(&self) -> &'a [String] { self.cells }
-    pub fn iter(&self) -> std::slice::Iter<'a, String> { self.cells.iter() }
-    pub fn columns(&self) -> impl Iterator<Item = &'a str> { self.schema.iter().map(|c| c.name.as_str()) }
+    pub(crate) fn new(schema: &'a [ColDef], raw: &[String]) -> Self {
+        Row {
+            schema,
+            cells: raw.iter().map(|v| display_value(v).to_string()).collect(),
+            raw: raw.to_vec(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+    pub fn cells(&self) -> &[String] {
+        &self.cells
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.cells.iter()
+    }
+    pub fn columns(&self) -> impl Iterator<Item = &'a str> {
+        self.schema.iter().map(|c| c.name.as_str())
+    }
 
     /// Rohtext einer Spalte (`None` = Spalte existiert nicht).
-    pub fn str(&self, col: &str) -> Option<&'a str> {
-        find_col(self.schema, col).map(|i| cell(self.cells, i))
+    pub fn str(&self, col: &str) -> Option<&str> {
+        find_col(self.schema, col).and_then(|i| self.cells.get(i).map(String::as_str))
     }
 
     /// Typisierter Zugriff nach Name.
@@ -867,17 +1660,83 @@ impl<'a> Row<'a> {
 
     /// Typisierter Zugriff nach Position.
     pub fn get_at<T: FromCell>(&self, i: usize) -> DbResult<T> {
-        let raw = cell(self.cells, i);
-        T::from_cell(raw).map_err(|why| DbError::TypeMismatch(format!(
-            "Spalte '{}': '{}' {}",
-            self.schema.get(i).map(|c| c.name.as_str()).unwrap_or("?"), raw, why
-        )))
+        let raw = cell(&self.raw, i);
+        T::from_cell(raw).map_err(|why| {
+            DbError::TypeMismatch(format!(
+                "Spalte '{}': '{}' {}",
+                self.schema.get(i).map(|c| c.name.as_str()).unwrap_or("?"),
+                raw,
+                why
+            ))
+        })
+    }
+
+    /// Read a cell as its native database value, preserving SQL NULL.
+    pub fn get_value(&self, col: &str) -> DbResult<Value> {
+        let i = find_col(self.schema, col).ok_or_else(|| unknown_col(col))?;
+        self.get_value_at(i)
+    }
+
+    /// Read a cell by position as its native database value.
+    pub fn get_value_at(&self, i: usize) -> DbResult<Value> {
+        let Some(c) = self.schema.get(i) else {
+            return Err(DbError::SchemaMismatch(format!(
+                "Spalte an Position {i} existiert nicht"
+            )));
+        };
+        let raw = cell(&self.raw, i);
+        if raw == NULL_CELL {
+            return Ok(Value::Null);
+        }
+        let value = match c.kind {
+            ColumnKind::Null => Value::Null,
+            ColumnKind::Int => Value::Int(
+                raw.parse()
+                    .map_err(|_| DbError::TypeMismatch(format!("'{}' ist kein Int", raw)))?,
+            ),
+            ColumnKind::Float => Value::Float(
+                raw.parse()
+                    .map_err(|_| DbError::TypeMismatch(format!("'{}' ist kein Float", raw)))?,
+            ),
+            ColumnKind::Text => Value::Text(display_value(raw).to_string()),
+            ColumnKind::Bool => Value::Bool(
+                raw.parse()
+                    .map_err(|_| DbError::TypeMismatch(format!("'{}' ist kein Bool", raw)))?,
+            ),
+            ColumnKind::Blob => Value::Blob(
+                hex_decode(raw).ok_or_else(|| DbError::TypeMismatch("ungültiges Blob".into()))?,
+            ),
+            ColumnKind::Timestamp => Value::Timestamp(
+                raw.parse()
+                    .map_err(|_| DbError::TypeMismatch("ungültiger Timestamp".into()))?,
+            ),
+            ColumnKind::Date => Value::Date(
+                raw.parse()
+                    .map_err(|_| DbError::TypeMismatch("ungültiges Date".into()))?,
+            ),
+            ColumnKind::Time => Value::Time(
+                raw.parse()
+                    .map_err(|_| DbError::TypeMismatch("ungültige Time".into()))?,
+            ),
+            ColumnKind::Uuid => Value::Uuid(
+                parse_uuid(raw).ok_or_else(|| DbError::TypeMismatch("ungültige UUID".into()))?,
+            ),
+            ColumnKind::Json => Value::Json(raw.to_string()),
+            ColumnKind::Decimal => {
+                let (coefficient, scale) = parse_decimal(raw)
+                    .ok_or_else(|| DbError::TypeMismatch("ungültiger Decimal".into()))?;
+                Value::Decimal { coefficient, scale }
+            }
+        };
+        Ok(value)
     }
 }
 
 impl<'a> Index<usize> for Row<'a> {
     type Output = String;
-    fn index(&self, i: usize) -> &String { self.cells.get(i).unwrap_or(&EMPTY) }
+    fn index(&self, i: usize) -> &String {
+        self.cells.get(i).unwrap_or(&EMPTY)
+    }
 }
 
 impl<'a, 'b> Index<&'b str> for Row<'a> {
@@ -886,7 +1745,10 @@ impl<'a, 'b> Index<&'b str> for Row<'a> {
     fn index(&self, col: &'b str) -> &String {
         match find_col(self.schema, col) {
             Some(i) => self.cells.get(i).unwrap_or(&EMPTY),
-            None => { eprintln!("DBCore: {}", unknown_col(col)); &EMPTY }
+            None => {
+                eprintln!("DBCore: {}", unknown_col(col));
+                &EMPTY
+            }
         }
     }
 }
@@ -894,7 +1756,9 @@ impl<'a, 'b> Index<&'b str> for Row<'a> {
 impl fmt::Debug for Row<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut m = f.debug_map();
-        for (i, c) in self.schema.iter().enumerate() { m.entry(&c.name, &cell(self.cells, i)); }
+        for (i, c) in self.schema.iter().enumerate() {
+            m.entry(&c.name, self.cells.get(i).unwrap_or(&EMPTY));
+        }
         m.finish()
     }
 }
@@ -919,12 +1783,61 @@ impl_from_cell! {
     f32 => "f32", f64 => "f64", bool => "bool",
 }
 impl FromCell for String {
-    fn from_cell(s: &str) -> std::result::Result<Self, String> { Ok(s.to_string()) }
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        Ok(display_value(s).to_string())
+    }
 }
-/// Leere Zelle → `None`.
+impl FromCell for Blob {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        hex_decode(s)
+            .map(Blob)
+            .ok_or_else(|| "ist kein Blob".into())
+    }
+}
+impl FromCell for Timestamp {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        s.parse()
+            .map(Timestamp)
+            .map_err(|_| "ist kein Timestamp".into())
+    }
+}
+impl FromCell for Date {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        s.parse().map(Date).map_err(|_| "ist kein Date".into())
+    }
+}
+impl FromCell for Time {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        s.parse().map(Time).map_err(|_| "ist keine Time".into())
+    }
+}
+impl FromCell for Uuid {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        parse_uuid(s)
+            .map(Uuid)
+            .ok_or_else(|| "ist keine UUID".into())
+    }
+}
+impl FromCell for Json {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        serde_json::from_str::<serde_json::Value>(s).map_err(|_| "ist kein JSON".to_string())?;
+        Ok(Json(s.to_string()))
+    }
+}
+impl FromCell for Decimal {
+    fn from_cell(s: &str) -> std::result::Result<Self, String> {
+        parse_decimal(s)
+            .map(|(coefficient, scale)| Decimal { coefficient, scale })
+            .ok_or_else(|| "ist kein Decimal".into())
+    }
+}
 impl<T: FromCell> FromCell for Option<T> {
     fn from_cell(s: &str) -> std::result::Result<Self, String> {
-        if s.is_empty() { Ok(None) } else { T::from_cell(s).map(Some) }
+        if s == NULL_CELL {
+            Ok(None)
+        } else {
+            T::from_cell(s).map(Some)
+        }
     }
 }
 
@@ -937,6 +1850,12 @@ pub trait FromRow: Sized {
 pub trait Model: FromRow {
     fn schema() -> Schema;
     fn to_values(&self) -> Vec<(&'static str, String)>;
+    fn to_typed_values(&self) -> Vec<(&'static str, Value)> {
+        self.to_values()
+            .into_iter()
+            .map(|(name, value)| (name, Value::Text(value)))
+            .collect()
+    }
 }
 
 // ───────────── DBCore ─────────────
@@ -983,21 +1902,34 @@ impl DBCore {
     pub fn temp() -> Self {
         match Self::try_temp() {
             Ok(db) => db,
-            Err(e) => { eprintln!("DBCore: {e}"); DBCore { dir: PathBuf::new(), store: None } }
+            Err(e) => {
+                eprintln!("DBCore: {e}");
+                DBCore {
+                    dir: PathBuf::new(),
+                    store: None,
+                }
+            }
         }
     }
 
     fn or_closed(dir: PathBuf, r: Result<DBCore>) -> DBCore {
         match r {
             Ok(db) => db,
-            Err(e) => { eprintln!("DBCore: {e}"); DBCore { dir, store: None } }
+            Err(e) => {
+                eprintln!("DBCore: {e}");
+                DBCore { dir, store: None }
+            }
         }
     }
 
     fn dir_for(input: &str) -> PathBuf {
-        if input.is_empty() { PathBuf::from(BASE_DIR) }
-        else if looks_like_path(input) { PathBuf::from(input) }
-        else { Path::new(BASE_DIR).join(input) }
+        if input.is_empty() {
+            PathBuf::from(BASE_DIR)
+        } else if looks_like_path(input) {
+            PathBuf::from(input)
+        } else {
+            Path::new(BASE_DIR).join(input)
+        }
     }
 
     pub fn try_new(input: &str) -> DbResult<Self> {
@@ -1009,54 +1941,89 @@ impl DBCore {
     pub fn try_at(dir: impl AsRef<Path>) -> DbResult<Self> {
         let dir = dir.as_ref().to_path_buf();
         let store = Store::open(dir.clone(), false)?;
-        Ok(DBCore { dir, store: Some(store) })
+        Ok(DBCore {
+            dir,
+            store: Some(store),
+        })
     }
     pub fn try_under(base: impl AsRef<Path>, name: &str) -> DbResult<Self> {
-        if !valid_name(name) { return Err(DbError::InvalidName); }
+        if !valid_name(name) {
+            return Err(DbError::InvalidName);
+        }
         Self::try_at(base.as_ref().join(name))
     }
     pub fn try_temp() -> DbResult<Self> {
         use std::sync::atomic::{AtomicU64, Ordering as AO};
         static N: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "dbcore-{}-{nanos}-{}", std::process::id(), N.fetch_add(1, AO::Relaxed)));
+            "dbcore-{}-{nanos}-{}",
+            std::process::id(),
+            N.fetch_add(1, AO::Relaxed)
+        ));
         let store = Store::open(dir.clone(), true)?;
-        Ok(DBCore { dir, store: Some(store) })
+        Ok(DBCore {
+            dir,
+            store: Some(store),
+        })
     }
 
     /// Verzeichnis der Datenbank.
-    pub fn path(&self) -> &Path { &self.dir }
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
 
     /// `true`, wenn die Datenbank geöffnet (Schlüssel geladen) ist.
-    pub fn is_open(&self) -> bool { self.store.is_some() }
+    pub fn is_open(&self) -> bool {
+        self.store.is_some()
+    }
 
-    pub(crate) fn st(&self) -> Result<&Arc<Store>> { self.store.as_ref().ok_or(DbError::Closed) }
+    pub(crate) fn st(&self) -> Result<&Arc<Store>> {
+        self.store.as_ref().ok_or(DbError::Closed)
+    }
 
     // ───── Einstellungen ─────
 
     /// Maximale Wartezeit auf den Schreib-Lock (Standard 10 s).
     pub fn set_busy_timeout(&self, d: Duration) {
-        if let Ok(s) = self.st() { s.set_busy_timeout(d); }
+        if let Ok(s) = self.st() {
+            s.set_busy_timeout(d);
+        }
     }
     /// `false` = kein `fsync` (schneller, aber nicht stromausfallsicher).
     pub fn set_sync(&self, on: bool) {
-        if let Ok(s) = self.st() { s.set_sync(on); }
+        if let Ok(s) = self.st() {
+            s.set_sync(on);
+        }
     }
     /// Tabellen-Cache an/aus (Standard an). Aus = geringster Speicherbedarf.
     pub fn set_cache(&self, on: bool) {
-        if let Ok(s) = self.st() { s.set_cache(on); }
+        if let Ok(s) = self.st() {
+            s.set_cache(on);
+        }
     }
     pub fn clear_cache(&self) {
-        if let Ok(s) = self.st() { s.clear_cache(); }
+        if let Ok(s) = self.st() {
+            s.clear_cache();
+        }
+    }
+
+    /// Spielt ein ausstehendes WAL ein und checkpointed es unter dem Schreib-Lock.
+    pub fn checkpoint(&self) -> DbResult<()> {
+        self.st()?.checkpoint()
     }
 
     // ───── Transaktionen & Snapshots ─────
 
-    /// Startet eine Schreib-Transaktion (wartet auf den Schreib-Lock).
-    /// Ohne [`Tx::commit`] wird beim Drop zurückgerollt.
-    pub fn begin(&self) -> DbResult<Tx> { Tx::begin(self.st()?) }
+    /// Startet eine Schreib-Transaktion auf einem festen Snapshot.
+    /// Der Schreib-Lock wird erst beim Commit angefordert. Ohne [`Tx::commit`]
+    /// wird beim Drop zurückgerollt.
+    pub fn begin(&self) -> DbResult<Tx> {
+        Tx::begin(self.st()?)
+    }
 
     /// Führt `f` in einer Transaktion aus: `Ok` → Commit, `Err`/Panic → Rollback.
     pub fn transaction<R>(&self, f: impl FnOnce(&Tx) -> DbResult<R>) -> DbResult<R> {
@@ -1068,7 +2035,9 @@ impl DBCore {
 
     /// Fester, konsistenter Lese-Stand über alle Tabellen. Bleibt gültig, egal
     /// wie viele Commits andere Schreiber inzwischen machen.
-    pub fn snapshot(&self) -> DbResult<Snapshot> { self.st()?.snapshot_pinned() }
+    pub fn snapshot(&self) -> DbResult<Snapshot> {
+        self.st()?.snapshot_pinned()
+    }
 
     // ───── Tabellen ─────
 
@@ -1090,7 +2059,9 @@ impl DBCore {
     }
 
     /// Namen aller Tabellen, alphabetisch.
-    pub fn tables(&self) -> Vec<String> { report(self.try_tables()).unwrap_or_default() }
+    pub fn tables(&self) -> Vec<String> {
+        report(self.try_tables()).unwrap_or_default()
+    }
     pub fn try_tables(&self) -> DbResult<Vec<String>> {
         Ok(self.st()?.snapshot()?.tables())
     }
@@ -1149,11 +2120,32 @@ impl DBCore {
     pub fn try_update(&self, table: &str, key: &str, values: Vec<(&str, String)>) -> DbResult<()> {
         self.transaction(|tx| tx.update(table, key, values))
     }
+    /// Insert with native, type-checked parameter values (including real NULL).
+    pub fn try_add_values(&self, table: &str, values: Vec<(&str, Value)>) -> DbResult<()> {
+        self.transaction(|tx| tx.add_values(table, values))
+    }
+    /// Upsert with native, type-checked parameter values.
+    pub fn try_put_values(&self, table: &str, values: Vec<(&str, Value)>) -> DbResult<String> {
+        self.transaction(|tx| tx.put_values(table, values))
+    }
+    /// Partial update with native, type-checked parameter values.
+    pub fn try_update_values(
+        &self,
+        table: &str,
+        key: &str,
+        values: Vec<(&str, Value)>,
+    ) -> DbResult<()> {
+        self.transaction(|tx| tx.update_values(table, key, values))
+    }
     /// `Ok(true)` = entfernt, `Ok(false)` = Key nicht vorhanden.
     pub fn try_remove(&self, table: &str, key: &str) -> DbResult<bool> {
         self.transaction(|tx| tx.remove(table, key))
     }
-    pub fn try_put_many(&self, table: &str, rows: Vec<Vec<(&str, String)>>) -> DbResult<Vec<String>> {
+    pub fn try_put_many(
+        &self,
+        table: &str,
+        rows: Vec<Vec<(&str, String)>>,
+    ) -> DbResult<Vec<String>> {
         self.transaction(|tx| tx.put_many(table, rows))
     }
     pub fn try_add_many(&self, table: &str, rows: Vec<Vec<(&str, String)>>) -> DbResult<()> {
@@ -1162,22 +2154,50 @@ impl DBCore {
 
     // ───── Zeilen lesen (Kurzformen, ungefiltert) ─────
 
-    pub fn print(&self, table: &str) { self.table(table).print() }
-    pub fn count(&self, table: &str) -> usize { self.table(table).count() }
-    pub fn try_count(&self, table: &str) -> DbResult<usize> { self.table(table).try_count() }
-    pub fn all(&self, table: &str) -> Vec<Vec<String>> { self.table(table).collect() }
-    pub fn try_all(&self, table: &str) -> DbResult<Vec<Vec<String>>> { self.table(table).try_collect() }
+    pub fn print(&self, table: &str) {
+        self.table(table).print()
+    }
+    pub fn count(&self, table: &str) -> usize {
+        self.table(table).count()
+    }
+    pub fn try_count(&self, table: &str) -> DbResult<usize> {
+        self.table(table).try_count()
+    }
+    pub fn all(&self, table: &str) -> Vec<Vec<String>> {
+        self.table(table).collect()
+    }
+    pub fn try_all(&self, table: &str) -> DbResult<Vec<Vec<String>>> {
+        self.table(table).try_collect()
+    }
 
     /// Zeile per Key. Leerer `Vec` = nicht gefunden (oder Fehler).
     /// Mit `has()` / `try_get()` lässt sich das unterscheiden.
     pub fn get(&self, table: &str, key: &str) -> Vec<String> {
-        report(self.try_get(table, key)).flatten().unwrap_or_default()
+        report(self.try_get(table, key))
+            .flatten()
+            .unwrap_or_default()
     }
     pub fn has(&self, table: &str, key: &str) -> bool {
         report(self.try_get(table, key)).flatten().is_some()
     }
     pub fn try_get(&self, table: &str, key: &str) -> DbResult<Option<Vec<String>>> {
-        self.st()?.with_snapshot(|s| s.get_row(table, key))
+        self.st()?.with_snapshot(|s| {
+            let Some(row) = s.get_row(table, key)? else {
+                return Ok(None);
+            };
+            let schema = s.schema(table)?;
+            Ok(Some(display_row(&schema, &row)))
+        })
+    }
+    /// Fetch a single value without collapsing NULL into an empty string.
+    pub fn try_get_value(&self, table: &str, key: &str, col: &str) -> DbResult<Option<Value>> {
+        self.st()?.with_snapshot(|s| {
+            let Some(raw) = s.get_row(table, key)? else {
+                return Ok(None);
+            };
+            let schema = s.schema(table)?;
+            Row::new(&schema, &raw).get_value(col).map(Some)
+        })
     }
 
     // ───── Query-Handle ─────
@@ -1187,7 +2207,9 @@ impl DBCore {
     /// ```ignore
     /// db.table("users").filter(with!(r => r[2] == "0")).order_by("name").print();
     /// ```
-    pub fn table<'a>(&'a self, name: &str) -> Table<'a> { Table::on_db(self, name) }
+    pub fn table<'a>(&'a self, name: &str) -> Table<'a> {
+        Table::on_db(self, name)
+    }
 
     // ───── Schema-Änderungen (Migrationen) ─────
 
@@ -1216,7 +2238,11 @@ impl DBCore {
     pub fn try_indexes(&self, table: &str) -> DbResult<Vec<String>> {
         self.st()?.with_snapshot(|s| {
             let d = s.data(table)?;
-            Ok(d.schema.iter().filter(|c| c.is_indexed()).map(|c| c.name.clone()).collect())
+            Ok(d.schema
+                .iter()
+                .filter(|c| c.is_indexed())
+                .map(|c| c.name.clone())
+                .collect())
         })
     }
 
@@ -1247,8 +2273,12 @@ impl DBCore {
     }
 
     /// Schema-Versionsnummer der Datenbank (Start: 0).
-    pub fn user_version(&self) -> u32 { report(self.try_user_version()).unwrap_or(0) }
-    pub fn try_user_version(&self) -> DbResult<u32> { Ok(self.st()?.snapshot()?.user_version()) }
+    pub fn user_version(&self) -> u32 {
+        report(self.try_user_version()).unwrap_or(0)
+    }
+    pub fn try_user_version(&self) -> DbResult<u32> {
+        Ok(self.st()?.snapshot()?.user_version())
+    }
     pub fn set_user_version(&self, v: u32) -> bool {
         report(self.transaction(|tx| tx.set_user_version(v))).is_some()
     }
@@ -1270,7 +2300,9 @@ impl DBCore {
         steps.sort_by_key(|s| s.0);
         for (v, f) in steps {
             self.transaction(|tx| {
-                if tx.user_version() >= *v { return Ok(()); }
+                if tx.user_version() >= *v {
+                    return Ok(());
+                }
                 f(tx)?;
                 tx.set_user_version(*v)
             })?;
@@ -1290,7 +2322,7 @@ impl DBCore {
         report(self.try_put_model(table, m)).unwrap_or_default()
     }
     pub fn try_put_model<M: Model>(&self, table: &str, m: &M) -> DbResult<String> {
-        self.try_put(table, m.to_values())
+        self.try_put_values(table, m.to_typed_values())
     }
 
     // ───── Wartung ─────
@@ -1334,25 +2366,33 @@ pub trait json {
 }
 
 impl interface for DBCore {
-    fn open_interface(&self, port: u16) { web::serve(self, port); }
+    fn open_interface(&self, port: u16) {
+        web::serve(self, port);
+    }
 }
 
 impl csv for DBCore {
-    fn to_csv(&self, table: &str) -> String { self.table(table).to_csv() }
+    fn to_csv(&self, table: &str) -> String {
+        self.table(table).to_csv()
+    }
     fn export_csv(&self, table: &str, path: impl AsRef<Path>) -> bool {
         self.table(table).export_csv(path)
     }
 }
 
 impl html for DBCore {
-    fn to_html(&self, table: &str) -> String { self.table(table).to_html() }
+    fn to_html(&self, table: &str) -> String {
+        self.table(table).to_html()
+    }
     fn export_html(&self, table: &str, path: impl AsRef<Path>) -> bool {
         self.table(table).export_html(path)
     }
 }
 
 impl json for DBCore {
-    fn to_json(&self, table: &str) -> String { self.table(table).to_json() }
+    fn to_json(&self, table: &str) -> String {
+        self.table(table).to_json()
+    }
     fn export_json(&self, table: &str, path: impl AsRef<Path>) -> bool {
         self.table(table).export_json(path)
     }
@@ -1371,3 +2411,191 @@ fn _assert_send_sync() {
 type _Unused = HashSet<()>;
 #[allow(unused_imports)]
 use fs as _fs;
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    model! {
+        #[derive(Debug, Clone, PartialEq)]
+        struct OptionalModel {
+            @key id: i32,
+            value: Option<String>,
+        }
+    }
+
+    fn temp_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("dbcore-values-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn typed_values_null_empty_and_native_types_round_trip() {
+        let dir = temp_path();
+        let db = DBCore::try_at(&dir).unwrap();
+        db.set_sync(false);
+        db.try_create(
+            "values",
+            schema! {
+                @key id: i32,
+                empty: String,
+                nullable: Option<String>,
+                blob: Blob,
+                timestamp: Timestamp,
+                date: Date,
+                time: Time,
+                uuid: Uuid,
+                doc: Json,
+                amount: Decimal,
+            },
+        )
+        .unwrap();
+        let uuid = [0x12; 16];
+        db.try_add_values(
+            "values",
+            params! {
+                id: 1,
+                empty: "",
+                nullable: Value::Null,
+                blob: Blob(vec![0, 1, 254, 255]),
+                timestamp: Timestamp(1_700_000_000_000_000),
+                date: Date(20_000),
+                time: Time(45_000_000),
+                uuid: Uuid(uuid),
+                doc: Json("{\"ok\":true}".to_string()),
+                amount: Decimal { coefficient: -12345, scale: 2 },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.table("values").where_null("nullable").count(), 1);
+        assert_eq!(db.table("values").where_not_null("empty").count(), 1);
+        assert_eq!(
+            db.try_get_value("values", "1", "nullable").unwrap(),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "empty").unwrap(),
+            Some(Value::Text(String::new()))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "blob").unwrap(),
+            Some(Value::Blob(vec![0, 1, 254, 255]))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "uuid").unwrap(),
+            Some(Value::Uuid(uuid))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "timestamp").unwrap(),
+            Some(Value::Timestamp(1_700_000_000_000_000))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "date").unwrap(),
+            Some(Value::Date(20_000))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "time").unwrap(),
+            Some(Value::Time(45_000_000))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "doc").unwrap(),
+            Some(Value::Json("{\"ok\":true}".to_string()))
+        );
+        assert_eq!(
+            db.try_get_value("values", "1", "amount").unwrap(),
+            Some(Value::Decimal {
+                coefficient: -12345,
+                scale: 2
+            })
+        );
+        assert!(db.integrity_check().is_empty());
+        drop(db);
+
+        let reopened = DBCore::try_at(&dir).unwrap();
+        assert_eq!(
+            reopened.try_get_value("values", "1", "nullable").unwrap(),
+            Some(Value::Null)
+        );
+        assert_eq!(reopened.table("values").where_null("nullable").count(), 1);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn typed_parameters_reject_wrong_types_and_preserve_nul_text() {
+        let db = DBCore::temp();
+        db.try_create("items", schema! { @key id: i32, value: String })
+            .unwrap();
+        assert!(matches!(
+            db.try_add_values("items", params! { id: 1, value: Value::Int(7) }),
+            Err(DbError::TypeMismatch(_))
+        ));
+        db.try_add_values("items", params! { id: 1, value: "\0text" })
+            .unwrap();
+        assert_eq!(
+            db.try_get_value("items", "1", "value").unwrap(),
+            Some(Value::Text("\0text".to_string()))
+        );
+        assert_eq!(db.table("items").where_eq("value", "\0text").count(), 1);
+    }
+
+    #[test]
+    fn nullable_unique_values_and_decimal_ordering_are_native() {
+        let db = DBCore::temp();
+        db.try_create(
+            "unique_items",
+            schema! { @key id: i32, value: Option<String> }.unique(&["value"]),
+        )
+        .unwrap();
+        db.try_add_values("unique_items", params! { id: 1, value: Value::Null })
+            .unwrap();
+        db.try_add_values("unique_items", params! { id: 2, value: Value::Null })
+            .unwrap();
+        db.try_add_values("unique_items", params! { id: 3, value: "" })
+            .unwrap();
+        assert!(matches!(
+            db.try_add_values("unique_items", params! { id: 4, value: "" }),
+            Err(DbError::Unique(_))
+        ));
+        assert_eq!(db.table("unique_items").where_null("value").count(), 2);
+        assert_eq!(db.table("unique_items").where_eq("value", "").count(), 1);
+
+        db.try_create("decimals", schema! { @key id: i32, value: Decimal })
+            .unwrap();
+        for (id, coefficient, scale) in [(1, 22, 1), (2, -11, 1), (3, -2, 0), (4, 5, 1)] {
+            db.try_add_values(
+                "decimals",
+                params! {
+                    id: id, value: Decimal { coefficient, scale }
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.table("decimals").order_by("value").values("value"),
+            ["-2", "-1.1", "0.5", "2.2"]
+        );
+    }
+
+    #[test]
+    fn model_option_fields_keep_null_separate_from_empty_text() {
+        let db = DBCore::temp();
+        db.try_create_model::<OptionalModel>("models").unwrap();
+        db.try_put_model("models", &OptionalModel { id: 1, value: None }).unwrap();
+        db.try_put_model("models", &OptionalModel { id: 2, value: Some(String::new()) })
+            .unwrap();
+        assert_eq!(db.try_get_value("models", "1", "value").unwrap(), Some(Value::Null));
+        assert_eq!(
+            db.try_get_value("models", "2", "value").unwrap(),
+            Some(Value::Text(String::new()))
+        );
+        let rows: Vec<OptionalModel> = db.table("models").collect_as();
+        assert_eq!(rows[0].value, None);
+        assert_eq!(rows[1].value.as_deref(), Some(""));
+    }
+}

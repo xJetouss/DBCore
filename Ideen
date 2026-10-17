@@ -1,7 +1,4 @@
 #	Thema	Inhalt	Aufwand
-P1	WAL & Crash Recovery	Write-Ahead-Log, Checkpointing, Recovery beim Öffnen, Torn-Write-Erkennung, Kill-Injection-Tests	🔴
-P2	MVCC & Concurrency	Mehrere gleichzeitige Leser und Schreiber, Schreib-Locks pro Tabelle oder Zeile, Konflikterkennung (optimistisch), Garbage Collection alter Versionen	🔴
-P3	Native Datentypen	Value-Enum mit Null, Int, Float, Text, Bool, Blob, Timestamp/Date/Time, Uuid, Json, Decimal. Echtes NULL statt leerem String. Typisierte Parameter	🔴
 P4	Query Optimizer	Statistiken (Zeilenzahl, Distinct-Werte, Histogramme), kostenbasierte Indexwahl, Join-Reihenfolge, Predicate Pushdown, explain analyze	🔴
 P5	Backup & Restore	Online-Backup aus einem Snapshot, Wiederherstellung, Integritätsprüfung des Backups, inkrementelle Backups	🟡
 P6	Composite Indexes	Mehrspaltig (user_id + created_at), Prefix-Nutzung, Teilindizes, Ausdrucksindizes, Covering Indexes	🟡

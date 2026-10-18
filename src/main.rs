@@ -452,6 +452,203 @@ fn main() {
                 assert!(d2.indexes("t").contains(&"a".to_string()));
             },
         );
+        println!("\n▌ P6 Composite Indexes");
+        r.run(
+            "Mehrspaltiger Index: zusammengesetzte Suche und Prefix-Nutzung",
+            || {
+                let dir = tmpdir("composite-index");
+                let d = DBCore::at(&dir);
+                d.set_sync(false);
+                d.create(
+                    "events",
+                    schema! {
+                        @key id: i32,
+                        user_id: i32,
+                        created_at: i64,
+                        status: String,
+                        email: String,
+                        action: String
+                    },
+                );
+                assert!(d.add_many(
+                    "events",
+                    (0..1_000)
+                        .map(|id| row! {
+                            id: id,
+                            user_id: id % 20,
+                            created_at: id as i64,
+                            status: if id % 3 == 0 { "active" } else { "inactive" },
+                            email: format!("User{id}@Example.com"),
+                            action: format!("action-{id}")
+                        })
+                        .collect(),
+                ));
+                assert!(d.create_composite_index("events", &["user_id", "created_at"]));
+                let definitions = d.try_index_definitions("events").unwrap();
+                let composite = d
+                    .table("events")
+                    .where_eq("user_id", 7)
+                    .where_eq("created_at", 147)
+                    .explain();
+                assert!(composite.contains(&definitions[0]), "{composite}");
+                assert!(composite.contains("prefix=2"), "{composite}");
+                assert_eq!(
+                    d.table("events")
+                        .where_eq("user_id", 7)
+                        .where_eq("created_at", 147)
+                        .values("action"),
+                    ["action-147"]
+                );
+
+                let prefix = d.table("events").where_eq("user_id", 7).explain();
+                assert!(prefix.contains(&definitions[0]), "{prefix}");
+                assert!(prefix.contains("prefix=1"), "{prefix}");
+
+                assert!(d.create_partial_index(
+                    "events",
+                    &["user_id", "created_at"],
+                    IndexPredicate::equals("status", "active"),
+                ));
+                let partial_name = d.try_index_definitions("events").unwrap()[1].clone();
+                let partial = d
+                    .table("events")
+                    .where_eq("user_id", 7)
+                    .where_eq("status", "active")
+                    .explain();
+                assert!(
+                    partial.contains(&partial_name),
+                    "{partial} expected {partial_name}"
+                );
+                assert_eq!(
+                    d.table("events")
+                        .where_eq("user_id", 7)
+                        .where_eq("status", "active")
+                        .count(),
+                    17
+                );
+                let not_implied = d
+                    .table("events")
+                    .where_eq("user_id", 7)
+                    .where_eq("status", "inactive")
+                    .explain();
+                assert!(!not_implied.contains(&partial_name), "{not_implied}");
+
+                assert!(d.create_expression_index("events", IndexExpression::lower("email"),));
+                let expression_name = d.try_index_definitions("events").unwrap()[2].clone();
+                let expression = d
+                    .table("events")
+                    .where_expr_eq(IndexExpression::lower("email"), "user147@example.com");
+                assert!(expression.explain().contains(&expression_name));
+                assert_eq!(expression.values("id"), ["147"]);
+
+                let cover = dir.join("cover");
+                let cover_db = DBCore::at(&cover);
+                cover_db.set_sync(false);
+                cover_db.create(
+                    "events",
+                    schema! {
+                        @key id: i32,
+                        user_id: i32,
+                        created_at: i64,
+                        action: String
+                    },
+                );
+                assert!(cover_db.add_many(
+                    "events",
+                    (0..200)
+                        .map(|id| row! {
+                            id: id,
+                            user_id: id % 20,
+                            created_at: id as i64,
+                            action: format!("open-{id}")
+                        })
+                        .collect(),
+                ));
+                assert!(cover_db.create_covering_index(
+                    "events",
+                    &["user_id", "created_at"],
+                    &["action"],
+                ));
+                let covering_name = cover_db.try_index_definitions("events").unwrap()[0].clone();
+                let covering = cover_db
+                    .table("events")
+                    .where_eq("user_id", 7)
+                    .where_eq("created_at", 147)
+                    .select(&["created_at", "action"]);
+                assert!(covering
+                    .explain()
+                    .contains(&format!("{covering_name} COVERING")));
+                assert_eq!(covering.collect(), vec![vec!["147", "open-147"]]);
+
+                let reopened = DBCore::at(&dir);
+                let persisted = reopened
+                    .table("events")
+                    .where_expr_eq(IndexExpression::lower("email"), "user147@example.com")
+                    .explain();
+                assert!(persisted.contains(&expression_name), "{persisted}");
+                assert!(reopened
+                    .try_drop_index_by_name("events", &partial_name)
+                    .is_ok());
+                assert!(!reopened
+                    .try_index_definitions("events")
+                    .unwrap()
+                    .contains(&partial_name));
+                assert!(reopened.integrity_check().is_empty());
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(cover);
+            },
+        );
+        println!("\n▌ P4 Query-Optimizer");
+        r.run("Statistiken, Histogramme, Kostenwahl, Join-Pushdown und EXPLAIN ANALYZE", || {
+            let d = db();
+            d.create(
+                "facts",
+                schema! { @key id: i32, grp: i32, note: Option<String> }.index(&["grp"]),
+            );
+            assert!(d.add_many(
+                "facts",
+                (0..1_000).map(|i| row! { id: i, grp: i % 100 }).collect(),
+            ));
+            let stats = d.analyze("facts").unwrap();
+            assert_eq!(stats.row_count, 1_000);
+            let grp = stats.columns.iter().find(|c| c.name == "grp").unwrap();
+            assert_eq!(grp.distinct_count, 100);
+            assert_eq!(grp.null_count, 0);
+            assert!(!grp.histogram.is_empty() && grp.histogram.len() <= 10);
+            assert_eq!(grp.histogram.iter().map(|b| b.count).sum::<usize>(), 1_000);
+            let note = stats.columns.iter().find(|c| c.name == "note").unwrap();
+            assert_eq!(note.null_count, 1_000);
+            assert!(note.histogram.is_empty());
+
+            let selective = d.table("facts").where_eq("grp", 3).explain();
+            assert!(selective.contains("USING INDEX grp"));
+            assert!(selective.contains("estimated rows=10"));
+            let unselective = d.table("facts").where_in("grp", 0..100).explain();
+            assert!(unselective.starts_with("SCAN facts"));
+            assert!(!unselective.contains("USING INDEX"));
+            let analyzed = d.table("facts").where_eq("grp", 3).try_explain_analyze().unwrap();
+            assert!(analyzed.contains("ANALYZE actual rows=10 loops=1 elapsed="));
+
+            d.create("base", schema! { @key id: i32 });
+            d.create("wide", schema! { @key id: i32, label: String });
+            d.create("tiny", schema! { @key id: i32, label: String });
+            assert!(d.add_many("base", (0..20).map(|i| row! { id: i }).collect()));
+            assert!(d.add_many("wide", (0..20).map(|i| row! { id: i, label: format!("W{i}") }).collect()));
+            assert!(d.add_many("tiny", [row! { id: 18, label: "T18" }, row! { id: 19, label: "T19" }].into()));
+            let query = d.table("base")
+                .join("wide", "base.id", "id")
+                .join("tiny", "base.id", "id")
+                .where_ge("base.id", 18)
+                .where_eq("tiny.id", 18)
+                .select(&["wide.label", "tiny.label", "base.id"]);
+            let plan = query.explain();
+            assert!(plan.find("JOIN tiny").unwrap() < plan.find("JOIN wide").unwrap(), "{plan}");
+            assert!(plan.contains("predicate pushdown: 2 rows"));
+            assert!(plan.contains("predicate pushdown: 1 rows"));
+            assert_eq!(query.collect(), vec![vec!["W18", "T18", "18"]]);
+            let analyzed_join = query.explain_analyze();
+            assert!(analyzed_join.contains("ANALYZE actual rows=1"), "{analyzed_join}");
+        });
 
         println!("\n▌ 8 Joins, Gruppierung, Mengen");
         r.run("INNER/LEFT JOIN, Mehrfach-Join, Mehrdeutigkeit", || {
@@ -610,6 +807,126 @@ fn main() {
                     snap.table("users").try_patch(row! { age: 1 }),
                     Err(DbError::ReadOnly)
                 ));
+            },
+        );
+        println!("\n▌ P5 Backup & Restore");
+        r.run(
+            "Online-Vollbackup aus konsistentem Snapshot + Integritätsprüfung",
+            || {
+                let root = tmpdir("backup-online");
+                let source = root.join("source");
+                let full = root.join("full");
+                let restored_path = root.join("restored");
+                let d = DBCore::at(&source);
+                d.set_sync(false);
+                d.create("left", schema! { @key id: i32, value: i32 });
+                d.create("right", schema! { @key id: i32, value: i32 });
+                d.create("payload", schema! { @key id: i32, body: String });
+                d.transaction(|tx| {
+                    tx.put("left", row! { id: 1, value: 0 })?;
+                    tx.put("right", row! { id: 1, value: 0 })?;
+                    Ok(())
+                })
+                .unwrap();
+                assert!(d.add_many(
+                    "payload",
+                    (0..8_000)
+                        .map(|id| row! { id: id, body: "snapshot-payload".repeat(12) })
+                        .collect(),
+                ));
+                let snapshot = d.snapshot().unwrap();
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let writer_db = d.clone();
+                let writer = thread::spawn(move || {
+                    for value in 1..=100 {
+                        transaction_retry(&writer_db, |tx| {
+                            tx.update("left", "1", row! { value: value })?;
+                            tx.update("right", "1", row! { value: value })
+                        })
+                        .unwrap();
+                        if value == 1 {
+                            started_tx.send(()).unwrap();
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                started_rx.recv().unwrap();
+                snapshot.backup_to(&full).unwrap();
+                writer.join().unwrap();
+
+                assert!(DBCore::verify_backup(&full).unwrap().is_empty());
+                let backup = DBCore::try_at(&full).unwrap();
+                assert_eq!(backup.count("payload"), 8_000);
+                assert_eq!(backup.get("left", "1")[1], "0");
+                assert_eq!(backup.get("right", "1")[1], "0");
+
+                let restored = DBCore::restore_from(&full, &[], &restored_path).unwrap();
+                assert_eq!(restored.get("left", "1"), backup.get("left", "1"));
+                assert_eq!(restored.get("right", "1"), backup.get("right", "1"));
+                assert_eq!(restored.count("payload"), 8_000);
+                assert!(restored.integrity_check().is_empty());
+
+                let damaged = root.join("damaged");
+                d.backup_to(&damaged).unwrap();
+                let table_file = tbl_files(&damaged).into_iter().next().unwrap();
+                let mut bytes = std::fs::read(&table_file).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                std::fs::write(table_file, bytes).unwrap();
+                assert!(!DBCore::verify_backup(&damaged).unwrap().is_empty());
+                let damaged_restore = root.join("damaged-restore");
+                assert!(DBCore::restore_from(&damaged, &[], &damaged_restore).is_err());
+                assert!(!damaged_restore.exists());
+                let _ = std::fs::remove_dir_all(&root);
+            },
+        );
+        r.run(
+            "Inkrementelle Änderungen, Ketten-Restore und falsche Reihenfolge",
+            || {
+                let root = tmpdir("backup-incremental");
+                let source = root.join("source");
+                let full = root.join("full");
+                let first = root.join("increment-1");
+                let second = root.join("increment-2");
+                let restored_path = root.join("restored");
+                let d = DBCore::at(&source);
+                d.set_sync(false);
+                d.create("items", schema! { @key id: i32, value: i32 });
+                d.create("stable", schema! { @key id: i32, value: String });
+                d.create("removed", schema! { @key id: i32 });
+                d.put("items", row! { id: 1, value: 10 });
+                d.put("items", row! { id: 2, value: 20 });
+                d.put("stable", row! { id: 1, value: "unchanged" });
+                d.put("removed", row! { id: 1 });
+                d.backup_to(&full).unwrap();
+
+                d.put("items", row! { id: 1, value: 11 });
+                assert!(d.delete_table("removed"));
+                d.create("added", schema! { @key id: i32, value: String });
+                d.put("added", row! { id: 1, value: "new table" });
+                d.backup_incremental_to(&full, &first).unwrap();
+                assert_eq!(tbl_files(&first).len(), 2, "nur geänderte/neue Tabellen");
+
+                d.put("items", row! { id: 2, value: 22 });
+                d.backup_incremental_to(&first, &second).unwrap();
+                assert_eq!(tbl_files(&second).len(), 1, "unveränderte Tabellen fehlen");
+
+                let chain = vec![first.clone(), second.clone()];
+                assert!(DBCore::verify_backup_chain(&full, &chain)
+                    .unwrap()
+                    .is_empty());
+                let restored = DBCore::restore_from(&full, &chain, &restored_path).unwrap();
+                assert_eq!(restored.get("items", "1")[1], "11");
+                assert_eq!(restored.get("items", "2")[1], "22");
+                assert_eq!(restored.get("stable", "1")[1], "unchanged");
+                assert_eq!(restored.get("added", "1")[1], "new table");
+                assert!(!restored.has_table("removed"));
+                assert!(restored.integrity_check().is_empty());
+
+                let wrong_path = root.join("wrong-chain");
+                assert!(DBCore::restore_from(&full, &[second], &wrong_path).is_err());
+                assert!(!wrong_path.exists());
+                let _ = std::fs::remove_dir_all(&root);
             },
         );
 

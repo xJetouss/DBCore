@@ -1,7 +1,4 @@
 #	Thema	Inhalt	Aufwand
-P4	Query Optimizer	Statistiken (Zeilenzahl, Distinct-Werte, Histogramme), kostenbasierte Indexwahl, Join-Reihenfolge, Predicate Pushdown, explain analyze	🔴
-P5	Backup & Restore	Online-Backup aus einem Snapshot, Wiederherstellung, Integritätsprüfung des Backups, inkrementelle Backups	🟡
-P6	Composite Indexes	Mehrspaltig (user_id + created_at), Prefix-Nutzung, Teilindizes, Ausdrucksindizes, Covering Indexes	🟡
 P7	SQL-Subset & Prepared Statements	Parser (SELECT … WHERE x = $1), Abbildung auf den bestehenden Planer, Prepared Statements, berechnete Spalten, CASE, String-Funktionen	🟡–🔴
 
 Abhängigkeiten: P3 (Typen) zuerst, denn P4, P6 und P7 bauen darauf auf. P1 (WAL) vor P2 (MVCC), weil die Nebenläufigkeit auf dem Log aufsetzt. Mit P5 kannst du früh anfangen, weil du die Snapshots schon hast.

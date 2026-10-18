@@ -80,6 +80,18 @@
 //! nie still geschluckt.
 //! [`DBCore::integrity_check`] prüft die ganze Datenbank.
 //!
+//! ## 3a. Backup und Restore
+//! [`Snapshot::backup_to`] sichert einen expliziten Snapshot; alternativ
+//! erstellt [`DBCore::backup_to`] direkt einen aktuellen Snapshot für ein
+//! Online-Vollbackup. [`DBCore::backup_incremental_to`] sichert nur seit dem
+//! angegebenen vorherigen Backup geänderte, unveränderliche Tabellendateien.
+//! [`DBCore::restore_from`] spielt ein Vollbackup und danach eine geordnete
+//! Kette inkrementeller Backups in ein neues Verzeichnis ein. Mit
+//! [`DBCore::verify_backup`] bzw. [`DBCore::verify_backup_chain`] wird die
+//! authentifizierte Backup-Metadatei und anschließend die Integrität aller
+//! wiederhergestellten Tabellen geprüft. Backup- und Restore-Ziele müssen
+//! noch nicht existieren.
+//!
 //! ## 3. Nebenläufigkeit
 //! * [`DBCore`] ist `Clone + Send + Sync` – einfach pro Thread klonen.
 //! * **Beliebig viele Leser gleichzeitig** (Threads *und* Prozesse), ohne
@@ -105,8 +117,17 @@
 //!
 //! ## 5. Indizes
 //! `db.create_index("users", "name")`, `create_unique_index`, `drop_index`.
-//! Der Planer nutzt Indizes (und den `@key`) für `where_eq`, `where_in`,
-//! Bereichs-Bedingungen und `order_by … limit`. `table.explain()` zeigt den Plan.
+//! Zusammengesetzte, partielle, Ausdrucks- und Covering-Indizes stehen über
+//! `create_composite_index`, `create_partial_index`,
+//! `create_expression_index` und `create_covering_index` zur Verfügung.
+//! Komposit-Indizes unterstützen linke Präfixe; partielle Prädikate sind
+//! `Equals` und `IsNotNull`. Ausdrucksindizes unterstützen `lower`, `upper`
+//! und `length` und werden mit `where_expr_eq` abgefragt. Covering-Indizes
+//! deklarieren zusätzliche Spalten über `INCLUDE`.
+//! Der Planer nutzt Statistiken (`db.analyze("users")`), wählt selektive
+//! Indexzugriffe kostenbasiert, schiebt einfache Filter vor Joins und ordnet
+//! abhängige INNER JOINs nach geschätzter Größe. `table.explain()` zeigt den
+//! Plan, `table.explain_analyze()` ergänzt tatsächliche Ergebniszeilen und Laufzeit.
 //! Hinweis: Der Index lebt im Speicher pro Tabellenstand (Aufbau einmalig
 //! O(n log n) nach jeder Änderung); die Definition ist persistent.
 //!
@@ -171,7 +192,9 @@ mod web;
 pub(crate) use format::*;
 pub(crate) use store::{Store, TableData};
 
-pub use query::{Agg, Order, RowStream, Rows, Table};
+pub use query::{
+    Agg, ColumnStatistics, HistogramBucket, Order, RowStream, Rows, Table, TableStatistics,
+};
 pub use store::Snapshot;
 pub use tx::Tx;
 
@@ -761,6 +784,45 @@ pub struct ForeignKey {
     pub on_delete: OnDelete,
 }
 
+/// Supported deterministic expressions for expression indexes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexExpression {
+    Lower(String),
+    Upper(String),
+    Length(String),
+}
+
+impl IndexExpression {
+    pub fn lower(column: &str) -> Self {
+        Self::Lower(column.into())
+    }
+    pub fn upper(column: &str) -> Self {
+        Self::Upper(column.into())
+    }
+    pub fn length(column: &str) -> Self {
+        Self::Length(column.into())
+    }
+}
+
+/// Predicate for a partial index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexPredicate {
+    Equals { column: String, value: String },
+    IsNotNull(String),
+}
+
+impl IndexPredicate {
+    pub fn equals(column: &str, value: impl ToString) -> Self {
+        Self::Equals {
+            column: column.into(),
+            value: value.to_string(),
+        }
+    }
+    pub fn is_not_null(column: &str) -> Self {
+        Self::IsNotNull(column.into())
+    }
+}
+
 // ───────────── Column ─────────────
 
 #[derive(Debug, Clone)]
@@ -950,8 +1012,9 @@ impl Schema {
     }
 }
 
-/// ```ignore
-/// schema! { @key id: i32, name: String, views: i64 = 0 }
+/// ```
+/// use dbcore::schema;
+/// let _ = schema! { @key id: i32, name: String, views: i64 = 0 };
 /// ```
 #[macro_export]
 macro_rules! schema {
@@ -1028,9 +1091,12 @@ macro_rules! params {
 /// Erzeugt eine Filter-Closure; `r` ist eine [`Row`] mit Zugriff nach Position
 /// (`r[2]`) **und** Name (`r["views"]`, `r.get::<i64>("views")`).
 ///
-/// ```ignore
-/// db.table("users").filter(with!(r => r["name"] == "Alice")).print();
-/// db.table("users").filter(with!(r => r.get::<i64>("views").unwrap_or(0) > 0)).print();
+/// ```
+/// use dbcore::{schema, with, DBCore};
+/// let db = DBCore::temp();
+/// db.create("users", schema! { @key id: i32, name: String, views: i64 = 0 });
+/// let _ = db.table("users").filter(with!(r => r["name"] == "Alice"));
+/// let _ = db.table("users").filter(with!(r => r.get::<i64>("views").unwrap_or(0) > 0));
 /// ```
 #[macro_export]
 macro_rules! with {
@@ -1041,8 +1107,12 @@ macro_rules! with {
 
 /// Löscht alle Zeilen, für die der Ausdruck `true` ergibt. Liefert die Anzahl.
 ///
-/// ```ignore
+/// ```
+/// use dbcore::{remove_if, schema, DBCore};
+/// let db = DBCore::temp();
+/// db.create("users", schema! { @key id: i32, name: String, views: i64 = 0 });
 /// let n = remove_if!(db, "users", r => r[1].starts_with('A'));
+/// let _ = n;
 /// ```
 #[macro_export]
 macro_rules! remove_if {
@@ -1124,6 +1194,7 @@ pub enum DbError {
     Io(io::Error),
     Crypto(&'static str),
     Corrupt(&'static str),
+    BackupIntegrity(Vec<String>),
     InvalidName,
     TableExists(String),
     TableNotFound(String),
@@ -1161,6 +1232,13 @@ impl fmt::Display for DbError {
             DbError::Io(e) => write!(f, "I/O-Fehler: {e}"),
             DbError::Crypto(m) => write!(f, "Krypto-Fehler: {m}"),
             DbError::Corrupt(m) => write!(f, "Beschädigte Datei: {m}"),
+            DbError::BackupIntegrity(problems) => {
+                write!(
+                    f,
+                    "Backup-Integritätsprüfung fehlgeschlagen: {}",
+                    problems.join("; ")
+                )
+            }
             DbError::InvalidName => write!(f, "Ungültiger Name (erlaubt: a-z A-Z 0-9 _ -)"),
             DbError::TableExists(n) => write!(f, "Tabelle '{n}' existiert bereits"),
             DbError::TableNotFound(n) => write!(f, "Tabelle '{n}' nicht gefunden"),
@@ -2039,6 +2117,49 @@ impl DBCore {
         self.st()?.snapshot_pinned()
     }
 
+    /// Erstellt ein Online-Vollbackup des aktuellen, konsistenten Snapshots.
+    /// Das Zielverzeichnis darf noch nicht existieren.
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> DbResult<()> {
+        self.st()?.backup_to(destination.as_ref())
+    }
+
+    /// Sichert gegenüber `previous` nur geänderte Tabellendateien und speichert
+    /// den vollständigen Snapshot-Manifeststand für die Wiederherstellung.
+    pub fn backup_incremental_to(
+        &self,
+        previous: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> DbResult<()> {
+        self.st()?
+            .backup_incremental_to(previous.as_ref(), destination.as_ref())
+    }
+
+    /// Prüft ein Vollbackup einschließlich authentifizierter Tabellenblöcke.
+    /// Bei Schema- oder Constraint-Verstößen werden die Probleme zurückgegeben.
+    pub fn verify_backup(path: impl AsRef<Path>) -> DbResult<Vec<String>> {
+        Store::verify_backup(path.as_ref())
+    }
+
+    /// Stellt Vollbackup plus geordnete inkrementelle Backups in ein neues
+    /// Verzeichnis wieder her und öffnet die wiederhergestellte Datenbank.
+    pub fn restore_from(
+        base: impl AsRef<Path>,
+        increments: &[PathBuf],
+        destination: impl AsRef<Path>,
+    ) -> DbResult<Self> {
+        let destination = destination.as_ref();
+        Store::restore_from(base.as_ref(), increments, destination)?;
+        Self::try_at(destination)
+    }
+
+    /// Prüft eine vollständige Backup-Kette, ohne ein dauerhaftes Ziel anzulegen.
+    pub fn verify_backup_chain(
+        base: impl AsRef<Path>,
+        increments: &[PathBuf],
+    ) -> DbResult<Vec<String>> {
+        Store::verify_backup_chain(base.as_ref(), increments)
+    }
+
     // ───── Tabellen ─────
 
     pub fn create(&self, name: &str, schema: Schema) -> bool {
@@ -2204,8 +2325,11 @@ impl DBCore {
 
     /// Einstieg in den Query-Builder.
     ///
-    /// ```ignore
-    /// db.table("users").filter(with!(r => r[2] == "0")).order_by("name").print();
+    /// ```
+    /// use dbcore::{schema, with, DBCore};
+    /// let db = DBCore::temp();
+    /// db.create("users", schema! { @key id: i32, name: String, views: i64 = 0 });
+    /// let _ = db.table("users").filter(with!(r => r[2] == "0")).order_by("name");
     /// ```
     pub fn table<'a>(&'a self, name: &str) -> Table<'a> {
         Table::on_db(self, name)
@@ -2219,6 +2343,49 @@ impl DBCore {
     pub fn try_create_index(&self, table: &str, col: &str) -> DbResult<()> {
         self.transaction(|tx| tx.create_index(table, col))
     }
+    pub fn create_composite_index(&self, table: &str, columns: &[&str]) -> bool {
+        report(self.try_create_composite_index(table, columns)).is_some()
+    }
+    pub fn try_create_composite_index(&self, table: &str, columns: &[&str]) -> DbResult<()> {
+        self.transaction(|tx| tx.create_composite_index(table, columns))
+    }
+    pub fn create_partial_index(
+        &self,
+        table: &str,
+        columns: &[&str],
+        predicate: IndexPredicate,
+    ) -> bool {
+        report(self.try_create_partial_index(table, columns, predicate)).is_some()
+    }
+    pub fn try_create_partial_index(
+        &self,
+        table: &str,
+        columns: &[&str],
+        predicate: IndexPredicate,
+    ) -> DbResult<()> {
+        self.transaction(|tx| tx.create_partial_index(table, columns, predicate))
+    }
+    pub fn create_expression_index(&self, table: &str, expression: IndexExpression) -> bool {
+        report(self.try_create_expression_index(table, expression)).is_some()
+    }
+    pub fn try_create_expression_index(
+        &self,
+        table: &str,
+        expression: IndexExpression,
+    ) -> DbResult<()> {
+        self.transaction(|tx| tx.create_expression_index(table, expression))
+    }
+    pub fn create_covering_index(&self, table: &str, columns: &[&str], included: &[&str]) -> bool {
+        report(self.try_create_covering_index(table, columns, included)).is_some()
+    }
+    pub fn try_create_covering_index(
+        &self,
+        table: &str,
+        columns: &[&str],
+        included: &[&str],
+    ) -> DbResult<()> {
+        self.transaction(|tx| tx.create_covering_index(table, columns, included))
+    }
     pub fn create_unique_index(&self, table: &str, col: &str) -> bool {
         report(self.try_create_unique_index(table, col)).is_some()
     }
@@ -2231,6 +2398,12 @@ impl DBCore {
     pub fn try_drop_index(&self, table: &str, col: &str) -> DbResult<()> {
         self.transaction(|tx| tx.drop_index(table, col))
     }
+    pub fn drop_index_by_name(&self, table: &str, name: &str) -> bool {
+        report(self.try_drop_index_by_name(table, name)).is_some()
+    }
+    pub fn try_drop_index_by_name(&self, table: &str, name: &str) -> DbResult<()> {
+        self.transaction(|tx| tx.drop_index_by_name(table, name))
+    }
     /// Spalten mit Index (inkl. `@key` und `UNIQUE`).
     pub fn indexes(&self, table: &str) -> Vec<String> {
         report(self.try_indexes(table)).unwrap_or_default()
@@ -2242,6 +2415,16 @@ impl DBCore {
                 .iter()
                 .filter(|c| c.is_indexed())
                 .map(|c| c.name.clone())
+                .collect())
+        })
+    }
+    /// Names of persisted composite, partial, expression, and covering indexes.
+    pub fn try_index_definitions(&self, table: &str) -> DbResult<Vec<String>> {
+        self.st()?.with_snapshot(|s| {
+            Ok(s.data(table)?
+                .index_defs
+                .iter()
+                .map(|index| index.name.clone())
                 .collect())
         })
     }

@@ -6,6 +6,7 @@
 //! `rollback`/Drop verwirft alles, ohne dass etwas auf Platte geändert wurde.
 
 use super::*;
+use crate::store::{IndexDefinition, IndexTerm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -868,7 +869,10 @@ impl TxInner {
                 }
             }
         }
-        let data = Arc::new(TableData::new(new.to_string(), schema, d.rows.clone()));
+        let data = Arc::new(
+            TableData::new(new.to_string(), schema, d.rows.clone())
+                .with_indexes(d.index_defs.clone()),
+        );
         if self.base.tables.contains_key(old) {
             self.work.insert(old.to_string(), Slot::Dropped);
         } else {
@@ -971,6 +975,21 @@ impl TxInner {
                 r.child, r.ccol
             )));
         }
+        if d.index_defs.iter().any(|index| {
+            index.terms.iter().any(|term| term.column() == col)
+                || index.included.iter().any(|included| included == col)
+                || index
+                    .predicate
+                    .as_ref()
+                    .map_or(false, |predicate| match predicate {
+                        IndexPredicate::Equals { column, .. }
+                        | IndexPredicate::IsNotNull(column) => column == col,
+                    })
+        }) {
+            return Err(DbError::SchemaMismatch(format!(
+                "Spalte '{col}' wird von einem Index verwendet"
+            )));
+        }
         let w = self.work_mut(table)?;
         let dm = w.data_mut();
         dm.schema.remove(ci);
@@ -994,7 +1013,38 @@ impl TxInner {
             )));
         }
         let refs = self.referencing(table)?;
-        self.work_mut(table)?.data_mut().schema[ci].name = new.to_string();
+        let dm = self.work_mut(table)?.data_mut();
+        dm.schema[ci].name = new.to_string();
+        for index in &mut dm.index_defs {
+            for term in &mut index.terms {
+                match term {
+                    IndexTerm::Column(column)
+                    | IndexTerm::Lower(column)
+                    | IndexTerm::Upper(column)
+                    | IndexTerm::Length(column)
+                        if column == old =>
+                    {
+                        *column = new.to_string();
+                    }
+                    _ => {}
+                }
+            }
+            for included in &mut index.included {
+                if included == old {
+                    *included = new.to_string();
+                }
+            }
+            if let Some(predicate) = &mut index.predicate {
+                match predicate {
+                    IndexPredicate::Equals { column, .. } | IndexPredicate::IsNotNull(column)
+                        if column == old =>
+                    {
+                        *column = new.to_string();
+                    }
+                    _ => {}
+                }
+            }
+        }
         for r in refs.into_iter().filter(|r| r.pcol == old) {
             let cname = if r.child == table && r.ccol == old {
                 new.to_string()
@@ -1055,6 +1105,78 @@ impl TxInner {
         if !c.key {
             c.indexed = indexed;
         }
+        Ok(())
+    }
+
+    fn add_index_definition(
+        &mut self,
+        table: &str,
+        terms: Vec<IndexTerm>,
+        included: Vec<String>,
+        predicate: Option<IndexPredicate>,
+    ) -> Result<()> {
+        let data = self.view(table)?;
+        if terms.is_empty() {
+            return Err(DbError::SchemaMismatch(
+                "Ein Index braucht mindestens einen Schlüssel".into(),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for term in &terms {
+            if data.col(term.column()).is_none() {
+                return Err(unknown_col(term.column()));
+            }
+            if !seen.insert(term.column().to_string()) {
+                return Err(DbError::SchemaMismatch(format!(
+                    "Spalte '{}' kommt mehrfach im Index vor",
+                    term.column()
+                )));
+            }
+        }
+        for column in &included {
+            if data.col(column).is_none() {
+                return Err(unknown_col(column));
+            }
+            if !seen.insert(column.clone()) {
+                return Err(DbError::SchemaMismatch(format!(
+                    "Spalte '{column}' ist bereits Schlüssel oder INCLUDE-Spalte"
+                )));
+            }
+        }
+        if let Some(predicate) = &predicate {
+            let column = match predicate {
+                IndexPredicate::Equals { column, value } => {
+                    let ci = data.col(column).ok_or_else(|| unknown_col(column))?;
+                    validate_value(&data.schema[ci], value)?;
+                    column
+                }
+                IndexPredicate::IsNotNull(column) => {
+                    data.col(column).ok_or_else(|| unknown_col(column))?;
+                    column
+                }
+            };
+            if !valid_name(column) {
+                return Err(DbError::InvalidName);
+            }
+        }
+        let identity = format!("{terms:?}|{included:?}|{predicate:?}");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        identity.hash(&mut hasher);
+        let definition = IndexDefinition {
+            name: format!("idx_{:016x}", hasher.finish()),
+            terms,
+            included,
+            predicate,
+        };
+        if data
+            .index_defs
+            .iter()
+            .any(|existing| existing == &definition)
+        {
+            return Ok(());
+        }
+        self.work_mut(table)?.data_mut().index_defs.push(definition);
         Ok(())
     }
 }
@@ -1132,7 +1254,13 @@ impl Tx {
                         new.tables.remove(name);
                     }
                     Slot::Live(w) if w.dirty => {
-                        let f = store.write_table_file(name, &w.data.schema, &w.data.rows, seq)?;
+                        let f = store.write_table_file(
+                            name,
+                            &w.data.schema,
+                            &w.data.rows,
+                            &w.data.index_defs,
+                            seq,
+                        )?;
                         written.push(f.clone());
                         new.tables.insert(name.clone(), f.clone());
                         installs.push((name.clone(), f, w.data.clone()));
@@ -1346,6 +1474,84 @@ impl Tx {
     }
     pub fn create_index(&self, table: &str, col: &str) -> DbResult<()> {
         self.with(|i| i.set_index(table, col, None, true))
+    }
+    pub fn create_composite_index(&self, table: &str, columns: &[&str]) -> DbResult<()> {
+        self.with(|i| {
+            i.add_index_definition(
+                table,
+                columns
+                    .iter()
+                    .map(|column| IndexTerm::Column((*column).to_string()))
+                    .collect(),
+                Vec::new(),
+                None,
+            )
+        })
+    }
+    pub fn create_partial_index(
+        &self,
+        table: &str,
+        columns: &[&str],
+        predicate: IndexPredicate,
+    ) -> DbResult<()> {
+        self.with(|i| {
+            i.add_index_definition(
+                table,
+                columns
+                    .iter()
+                    .map(|column| IndexTerm::Column((*column).to_string()))
+                    .collect(),
+                Vec::new(),
+                Some(predicate),
+            )
+        })
+    }
+    pub fn create_expression_index(
+        &self,
+        table: &str,
+        expression: IndexExpression,
+    ) -> DbResult<()> {
+        self.with(|i| {
+            let term = match expression {
+                IndexExpression::Lower(column) => IndexTerm::Lower(column),
+                IndexExpression::Upper(column) => IndexTerm::Upper(column),
+                IndexExpression::Length(column) => IndexTerm::Length(column),
+            };
+            i.add_index_definition(table, vec![term], Vec::new(), None)
+        })
+    }
+    pub fn create_covering_index(
+        &self,
+        table: &str,
+        columns: &[&str],
+        included: &[&str],
+    ) -> DbResult<()> {
+        self.with(|i| {
+            i.add_index_definition(
+                table,
+                columns
+                    .iter()
+                    .map(|column| IndexTerm::Column((*column).to_string()))
+                    .collect(),
+                included
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect(),
+                None,
+            )
+        })
+    }
+    pub fn drop_index_by_name(&self, table: &str, name: &str) -> DbResult<()> {
+        self.with(|i| {
+            let d = i.view(table)?;
+            let Some(index) = d.index_defs.iter().position(|index| index.name == name) else {
+                return Err(DbError::SchemaMismatch(format!(
+                    "Index '{name}' nicht gefunden"
+                )));
+            };
+            i.work_mut(table)?.data_mut().index_defs.remove(index);
+            Ok(())
+        })
     }
     pub fn create_unique_index(&self, table: &str, col: &str) -> DbResult<()> {
         self.with(|i| i.set_index(table, col, Some(true), true))

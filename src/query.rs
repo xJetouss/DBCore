@@ -2,8 +2,9 @@
 //! Unterabfragen, lazy Streaming und Mutationen über Abfragen.
 
 use super::*;
-use crate::store::Scan;
+use crate::store::{IndexTerm, Scan};
 use std::collections::HashMap;
+use std::time::Instant;
 
 // ───────────── Lese-Kontext ─────────────
 
@@ -42,6 +43,47 @@ impl<'a> Ctx<'a> {
     }
 }
 
+fn partial_predicate_implied(
+    predicate: Option<&IndexPredicate>,
+    conditions: &[PCond],
+    schema: &[ColDef],
+) -> bool {
+    match predicate {
+        None => true,
+        Some(IndexPredicate::Equals { column, value }) => {
+            let Some(ci) = schema.iter().position(|col| &col.name == column) else {
+                return false;
+            };
+            conditions.iter().any(|condition| {
+                matches!(
+                    condition,
+                    PCond::Cmp {
+                        ci: condition_ci,
+                        op: CmpOp::Eq,
+                        val,
+                        ..
+                    } if *condition_ci == ci
+                        && norm_val(schema[ci].kind, val) == norm_val(schema[ci].kind, value)
+                )
+            })
+        }
+        Some(IndexPredicate::IsNotNull(column)) => {
+            let Some(ci) = schema.iter().position(|col| &col.name == column) else {
+                return false;
+            };
+            conditions.iter().any(|condition| {
+                matches!(
+                    condition,
+                    PCond::Null {
+                        ci: condition_ci,
+                        negate: true
+                    } if *condition_ci == ci
+                )
+            })
+        }
+    }
+}
+
 // ───────────── Bausteine ─────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,9 +94,12 @@ enum AggFn { Count, CountOf, Sum, Avg, Min, Max }
 
 /// Aggregat für [`Table::agg`].
 ///
-/// ```ignore
-/// db.table("posts").group_by(&["author"])
-///   .agg(&[Agg::count(), Agg::sum("likes").alias("total")])
+/// ```
+/// use dbcore::{schema, Agg, DBCore};
+/// let db = DBCore::temp();
+/// db.create("posts", schema! { @key id: i32, author: String, likes: i64 = 0 });
+/// let _ = db.table("posts").group_by(&["author"])
+///   .agg(&[Agg::count(), Agg::sum("likes").alias("total")]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Agg { func: AggFn, col: Option<String>, alias: Option<String> }
@@ -87,6 +132,7 @@ impl Agg {
 
 enum Cond<'a> {
     Cmp { col: String, op: CmpOp, val: String },
+    ExprCmp { expression: IndexExpression, val: String },
     Between { col: String, lo: String, hi: String },
     In { col: String, vals: Vec<String> },
     Like { col: String, pat: String },
@@ -100,6 +146,39 @@ enum PCond {
     InSet { ci: usize, kind: ColumnKind, set: HashSet<String>, negate: bool },
     Like { ci: usize, pat: String },
     Null { ci: usize, negate: bool },
+    ExprCmp {
+        ci: usize,
+        expression: IndexExpression,
+        kind: ColumnKind,
+        val: String,
+    },
+}
+
+impl PCond {
+    fn remap(&self, ci: usize) -> Self {
+        match self {
+            PCond::Cmp { kind, op, val, .. } => PCond::Cmp { ci, kind: *kind, op: *op, val: val.clone() },
+            PCond::Between { kind, lo, hi, .. } => PCond::Between {
+                ci, kind: *kind, lo: lo.clone(), hi: hi.clone(),
+            },
+            PCond::InSet { kind, set, negate, .. } => PCond::InSet {
+                ci, kind: *kind, set: set.clone(), negate: *negate,
+            },
+            PCond::Like { pat, .. } => PCond::Like { ci, pat: pat.clone() },
+            PCond::Null { negate, .. } => PCond::Null { ci, negate: *negate },
+            PCond::ExprCmp {
+                expression,
+                kind,
+                val,
+                ..
+            } => PCond::ExprCmp {
+                ci,
+                expression: expression.clone(),
+                kind: *kind,
+                val: val.clone(),
+            },
+        }
+    }
 }
 
 impl PCond {
@@ -117,16 +196,32 @@ impl PCond {
             PCond::InSet { ci, kind, set, negate } => set.contains(&norm_val(*kind, cell(row, *ci))) != *negate,
             PCond::Like { ci, pat } => like_match(pat, cell(row, *ci)),
             PCond::Null { .. } => false,
+            PCond::ExprCmp { ci, expression, kind, val } => {
+                let raw = cell(row, *ci);
+                let result = match expression {
+                    IndexExpression::Lower(_) => raw.to_lowercase(),
+                    IndexExpression::Upper(_) => raw.to_uppercase(),
+                    IndexExpression::Length(_) => raw.chars().count().to_string(),
+                };
+                cmp_values(*kind, &result, val) == Ordering::Equal
+            }
         }
     }
     fn col(&self) -> usize {
         match self { PCond::Cmp { ci, .. } | PCond::Between { ci, .. }
-            | PCond::InSet { ci, .. } | PCond::Like { ci, .. } | PCond::Null { ci, .. } => *ci }
+            | PCond::InSet { ci, .. } | PCond::Like { ci, .. } | PCond::Null { ci, .. }
+            | PCond::ExprCmp { ci, .. } => *ci }
     }
 }
 
 struct JoinSpec { table: String, left: String, right: String, outer: bool }
 struct GroupSpec { keys: Vec<String>, aggs: Vec<Agg> }
+struct JoinPlan {
+    data: Vec<Arc<TableData>>,
+    schema: Vec<ColDef>,
+    pushed_rows: Vec<Vec<Vec<String>>>,
+    order: Vec<usize>,
+}
 
 enum Src<'a> {
     Base { name: String, joins: Vec<JoinSpec> },
@@ -146,7 +241,100 @@ pub(crate) struct Rs { pub(crate) schema: Vec<ColDef>, pub(crate) rows: Vec<Vec<
 
 type RowFn<'a> = Box<dyn Fn(Row<'_>) -> bool + 'a>;
 
-enum Access { Full, Lookup { desc: String, positions: Vec<usize> }, OrderScan { col: usize, desc: bool } }
+enum Access {
+    Full,
+    Lookup {
+        desc: String,
+        positions: Vec<usize>,
+        cost: f64,
+        covered: Option<HashMap<usize, Vec<String>>>,
+    },
+    OrderScan { col: usize, desc: bool },
+}
+
+/// One equal-height bucket in a column histogram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistogramBucket {
+    pub lower_bound: String,
+    pub upper_bound: String,
+    pub count: usize,
+}
+
+/// Statistics calculated from the current table snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnStatistics {
+    pub name: String,
+    pub distinct_count: usize,
+    pub null_count: usize,
+    pub histogram: Vec<HistogramBucket>,
+}
+
+/// Row count and per-column statistics used to inspect optimizer estimates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableStatistics {
+    pub table: String,
+    pub row_count: usize,
+    pub columns: Vec<ColumnStatistics>,
+}
+
+impl TableStatistics {
+    fn from_data(data: &TableData) -> Self {
+        let columns = data.schema.iter().enumerate().map(|(ci, col)| {
+            let values: Vec<&str> = data.rows.iter().map(|r| cell(r, ci))
+                .filter(|v| *v != NULL_CELL).collect();
+            let null_count = data.rows.len() - values.len();
+            let distinct_count = values.iter().map(|v| norm_val(col.kind, v))
+                .collect::<HashSet<_>>().len();
+            let mut sorted = values;
+            sorted.sort_by(|a, b| cmp_values(col.kind, a, b));
+            let mut groups: Vec<(String, String, usize)> = Vec::new();
+            for value in sorted {
+                match groups.last_mut() {
+                    Some((_, upper, count)) if cmp_values(col.kind, upper, value) == Ordering::Equal => {
+                        *count += 1;
+                    }
+                    _ => groups.push((value.to_string(), value.to_string(), 1)),
+                }
+            }
+            let bucket_count = groups.len().min(10);
+            let mut histogram = Vec::with_capacity(bucket_count);
+            if bucket_count > 0 {
+                let mut remaining_rows = groups.iter().map(|g| g.2).sum::<usize>();
+                let mut start = 0;
+                for bucket in 0..bucket_count {
+                    let remaining_buckets = bucket_count - bucket;
+                    let target = (remaining_rows + remaining_buckets - 1) / remaining_buckets;
+                    let mut end = start;
+                    let mut count = 0;
+                    while end < groups.len() - (remaining_buckets - 1) && count < target {
+                        count += groups[end].2;
+                        end += 1;
+                    }
+                    histogram.push(HistogramBucket {
+                        lower_bound: groups[start].0.clone(),
+                        upper_bound: groups[end - 1].1.clone(),
+                        count,
+                    });
+                    remaining_rows -= count;
+                    start = end;
+                }
+            }
+            ColumnStatistics { name: col.name.clone(), distinct_count, null_count, histogram }
+        }).collect();
+        TableStatistics { table: data.name.clone(), row_count: data.rows.len(), columns }
+    }
+}
+
+impl DBCore {
+    /// Calculates row counts, distinct counts, NULL counts, and equal-height
+    /// histograms from one consistent snapshot of the table.
+    pub fn analyze(&self, table: &str) -> DbResult<TableStatistics> {
+        self.st()?.with_snapshot(|snapshot| {
+            let data = snapshot.data(table)?;
+            Ok(TableStatistics::from_data(&data))
+        })
+    }
+}
 
 // ───────────── Table ─────────────
 
@@ -213,6 +401,13 @@ impl<'a> Table<'a> {
     fn cond(mut self, c: Cond<'a>) -> Self { self.conds.push(c); self }
     pub fn where_eq(self, col: &str, v: impl ToString) -> Self {
         self.cond(Cond::Cmp { col: col.into(), op: CmpOp::Eq, val: v.to_string() })
+    }
+    /// Gleichheit über `lower`, `upper` oder `length` eines Ausdrucksindexes.
+    pub fn where_expr_eq(self, expression: IndexExpression, value: impl ToString) -> Self {
+        self.cond(Cond::ExprCmp {
+            expression,
+            val: value.to_string(),
+        })
     }
     pub fn where_ne(self, col: &str, v: impl ToString) -> Self {
         self.cond(Cond::Cmp { col: col.into(), op: CmpOp::Ne, val: v.to_string() })
@@ -342,6 +537,25 @@ impl<'a> Table<'a> {
         let mut out = Vec::with_capacity(self.conds.len());
         for c in &self.conds {
             out.push(match c {
+                Cond::ExprCmp { expression, val } => {
+                    let column = match expression {
+                        IndexExpression::Lower(column)
+                        | IndexExpression::Upper(column)
+                        | IndexExpression::Length(column) => column,
+                    };
+                    let ci = resolve_col(schema, column)?;
+                    let kind = if matches!(expression, IndexExpression::Length(_)) {
+                        ColumnKind::Int
+                    } else {
+                        ColumnKind::Text
+                    };
+                    PCond::ExprCmp {
+                        ci,
+                        expression: expression.clone(),
+                        kind,
+                        val: encode_query_value(kind, val),
+                    }
+                }
                 Cond::Cmp { col, op, val } => {
                     let ci = resolve_col(schema, col)?;
                     let kind = schema[ci].kind;
@@ -385,7 +599,13 @@ impl<'a> Table<'a> {
     }
 
     fn plan_access(&self, data: &TableData, pconds: &[PCond], order: &[(usize, Order)]) -> Access {
-        let mut best: Option<(String, Vec<usize>)> = None;
+        let mut best: Option<(
+            String,
+            Vec<usize>,
+            f64,
+            Option<HashMap<usize, Vec<String>>>,
+        )> = None;
+        let full_cost = data.rows.len() as f64;
         for pc in pconds {
             let ci = pc.col();
             if !data.is_indexed(ci) { continue; }
@@ -409,14 +629,123 @@ impl<'a> Table<'a> {
                 _ => None,
             };
             if let Some((d, p)) = found {
-                if best.as_ref().map_or(true, |(_, b)| p.len() < b.len()) { best = Some((d, p)); }
+                let cost = (data.rows.len() as f64 + 1.0).log2() + p.len() as f64;
+                if cost < full_cost
+                    && best
+                        .as_ref()
+                        .map_or(true, |(_, _, current, _)| cost < *current)
+                {
+                    best = Some((d, p, cost, None));
+                }
             }
         }
-        if let Some((desc, positions)) = best { return Access::Lookup { desc, positions }; }
+        for (index_number, definition) in data.index_defs.iter().enumerate() {
+            if !partial_predicate_implied(definition.predicate.as_ref(), pconds, &data.schema) {
+                continue;
+            }
+            let mut key = Vec::with_capacity(definition.terms.len());
+            for term in &definition.terms {
+                let found = pconds.iter().find_map(|condition| match (term, condition) {
+                    (IndexTerm::Column(column), PCond::Cmp { ci, kind, op: CmpOp::Eq, val })
+                        if data.schema[*ci].name == *column =>
+                    {
+                        Some((*kind, val.clone()))
+                    }
+                    (IndexTerm::Lower(column), PCond::ExprCmp {
+                        ci, expression: IndexExpression::Lower(expr_column), kind, val,
+                    }) if data.schema[*ci].name == *column && expr_column == column => {
+                        Some((*kind, val.clone()))
+                    }
+                    (IndexTerm::Upper(column), PCond::ExprCmp {
+                        ci, expression: IndexExpression::Upper(expr_column), kind, val,
+                    }) if data.schema[*ci].name == *column && expr_column == column => {
+                        Some((*kind, val.clone()))
+                    }
+                    (IndexTerm::Length(column), PCond::ExprCmp {
+                        ci, expression: IndexExpression::Length(expr_column), kind, val,
+                    }) if data.schema[*ci].name == *column && expr_column == column => {
+                        Some((*kind, val.clone()))
+                    }
+                    _ => None,
+                });
+                let Some((kind, value)) = found else {
+                    break;
+                };
+                key.push(crate::store::IKey::of(kind, &value));
+            }
+            if key.is_empty() {
+                continue;
+            }
+            let positions = data.composite_index(index_number).prefix(&key);
+            let cost = (data.rows.len() as f64 + 1.0).log2() + positions.len() as f64;
+            if cost < full_cost
+                && best
+                    .as_ref()
+                    .map_or(true, |(_, _, current, _)| cost < *current)
+            {
+                let covering = self.is_covering(data, definition, pconds, order);
+                let index = data.composite_index(index_number);
+                let covered = if covering {
+                    self.select.as_ref().and_then(|selected| {
+                        index.project(&positions, selected)
+                    })
+                } else {
+                    None
+                };
+                let label = if covered.is_some() {
+                    format!("{} COVERING", definition.name)
+                } else {
+                    definition.name.clone()
+                };
+                best = Some((
+                    format!("{label} (prefix={})", key.len()),
+                    positions,
+                    cost,
+                    covered,
+                ));
+            }
+        }
+        if let Some((desc, positions, cost, covered)) = best {
+            return Access::Lookup {
+                desc,
+                positions,
+                cost,
+                covered,
+            };
+        }
         if order.len() == 1 && data.is_indexed(order[0].0) {
             return Access::OrderScan { col: order[0].0, desc: order[0].1 == Order::Desc };
         }
         Access::Full
+    }
+
+    fn is_covering(
+        &self,
+        data: &TableData,
+        definition: &crate::store::IndexDefinition,
+        pconds: &[PCond],
+        order: &[(usize, Order)],
+    ) -> bool {
+        let Some(selected) = &self.select else {
+            return false;
+        };
+        let covered: HashSet<&str> = definition
+            .terms
+            .iter()
+            .filter_map(|term| match term {
+                IndexTerm::Column(column) => Some(column.as_str()),
+                _ => None,
+            })
+            .chain(definition.included.iter().map(String::as_str))
+            .collect();
+        selected.iter().all(|column| {
+            resolve_col(&data.schema, column)
+                .ok()
+                .map(|ci| covered.contains(data.schema[ci].name.as_str()))
+                .unwrap_or(false)
+        }) && pconds.iter().all(|condition| {
+            covered.contains(data.schema[condition.col()].name.as_str())
+        }) && order.iter().all(|(ci, _)| covered.contains(data.schema[*ci].name.as_str()))
     }
 
     /// Treffer-Positionen: filter → (order → skip → limit, wenn `final_stage`).
@@ -494,14 +823,91 @@ impl<'a> Table<'a> {
     fn run_simple(&self, data: &TableData, pconds: &[PCond]) -> Result<Rs> {
         if let Some(c) = &self.select { if c.iter().any(|c| c.starts_with('\u{0}')) { self.project_cols(&data.schema)?; } }
         let order = self.resolve_order(&data.schema)?;
-        let (pos, _) = self.positions(data, pconds, &order, self.skip, self.limit)?;
+        let (pos, access) = self.positions(data, pconds, &order, self.skip, self.limit)?;
         match self.project_cols(&data.schema)? {
             None => Ok(Rs { schema: data.schema.clone(), rows: pos.into_iter().map(|p| data.rows[p].clone()).collect() }),
-            Some((keep, proj)) => Ok(Rs {
-                schema: proj,
-                rows: pos.into_iter().map(|p| keep.iter().map(|&c| cell(&data.rows[p], c).to_string()).collect()).collect(),
-            }),
+            Some((keep, proj)) => {
+                let rows = pos
+                    .into_iter()
+                    .map(|p| match &access {
+                        Access::Lookup {
+                            covered: Some(rows),
+                            ..
+                        } => rows
+                            .get(&p)
+                            .cloned()
+                            .ok_or(DbError::Corrupt("Covering-Index-Wert fehlt")),
+                        _ => Ok(keep
+                            .iter()
+                            .map(|&c| cell(&data.rows[p], c).to_string())
+                            .collect()),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Rs {
+                    schema: proj,
+                    rows,
+                })
+            }
         }
+    }
+
+    fn join_plan(&self, rd: &dyn Reader, base: &str, joins: &[JoinSpec]) -> Result<JoinPlan> {
+        let mut data = Vec::with_capacity(joins.len() + 1);
+        data.push(rd.data(base)?);
+        for join in joins {
+            data.push(rd.data(&join.table)?);
+        }
+
+        let qualify = |table: &str, schema: &[ColDef]| -> Vec<ColDef> {
+            schema.iter().map(|c| {
+                let mut c = c.clone();
+                c.name = format!("{table}.{}", c.name);
+                c
+            }).collect()
+        };
+        let mut schema = qualify(base, &data[0].schema);
+        let mut offsets = Vec::with_capacity(data.len());
+        offsets.push(0);
+        for (index, join) in joins.iter().enumerate() {
+            offsets.push(schema.len());
+            schema.extend(qualify(&join.table, &data[index + 1].schema));
+        }
+        let pconds = self.prepare(&schema, rd)?;
+        let mut pushed_rows: Vec<Vec<Vec<String>>> = Vec::with_capacity(data.len());
+        for (source, table) in data.iter().enumerate() {
+            let start = offsets[source];
+            let end = start + table.schema.len();
+            let local: Vec<PCond> = pconds.iter().filter(|p| (start..end).contains(&p.col()))
+                .map(|p| p.remap(p.col() - start)).collect();
+            pushed_rows.push(table.rows.iter().filter(|row| local.iter().all(|p| p.eval(row)))
+                .cloned().collect());
+        }
+
+        let mut order = Vec::with_capacity(joins.len());
+        let mut current_schema = qualify(base, &data[0].schema);
+        let mut next = 0;
+        while next < joins.len() {
+            if joins[next].outer {
+                order.push(next);
+                current_schema.extend(qualify(&joins[next].table, &data[next + 1].schema));
+                next += 1;
+                continue;
+            }
+            let end = joins[next..].iter().position(|j| j.outer)
+                .map_or(joins.len(), |offset| next + offset);
+            let mut pending: Vec<usize> = (next..end).collect();
+            while !pending.is_empty() {
+                let chosen = pending.iter().copied()
+                    .filter(|&index| resolve_col(&current_schema, &joins[index].left).is_ok())
+                    .min_by_key(|&index| pushed_rows[index + 1].len())
+                    .unwrap_or(pending[0]);
+                order.push(chosen);
+                current_schema.extend(qualify(&joins[chosen].table, &data[chosen + 1].schema));
+                pending.retain(|&index| index != chosen);
+            }
+            next = end;
+        }
+        Ok(JoinPlan { data, schema, pushed_rows, order })
     }
 
     pub(crate) fn exec_with(&self, rd: &dyn Reader) -> Result<Rs> {
@@ -540,28 +946,30 @@ impl<'a> Table<'a> {
     }
 
     fn join_rows(&self, rd: &dyn Reader, base: &str, joins: &[JoinSpec]) -> Result<Rs> {
-        let b = rd.data(base)?;
         let qualify = |t: &str, s: &[ColDef]| -> Vec<ColDef> {
             s.iter().map(|c| { let mut c = c.clone(); c.name = format!("{t}.{}", c.name); c }).collect()
         };
-        let mut schema = qualify(base, &b.schema);
-        let mut rows: Vec<Vec<String>> = b.rows.clone();
-        for j in joins {
-            let rt = rd.data(&j.table)?;
+        let plan = self.join_plan(rd, base, joins)?;
+        let mut schema = qualify(base, &plan.data[0].schema);
+        let mut rows = plan.pushed_rows[0].clone();
+        for &join_index in &plan.order {
+            let j = &joins[join_index];
+            let rt = &plan.data[join_index + 1];
             let li = resolve_col(&schema, &j.left)?;
             let rname = j.right.strip_prefix(&format!("{}.", j.table)).unwrap_or(&j.right);
             let ri = rt.col(rname).ok_or_else(|| unknown_col(&j.right))?;
             let (lk, rk) = (schema[li].kind, rt.schema[ri].kind);
-            let mut map: HashMap<String, Vec<usize>> = HashMap::with_capacity(rt.rows.len());
-            for (p, r) in rt.rows.iter().enumerate() {
-                map.entry(norm_val(rk, cell(r, ri))).or_default().push(p);
+            let right_rows = &plan.pushed_rows[join_index + 1];
+            let mut map: HashMap<String, Vec<&Vec<String>>> = HashMap::with_capacity(right_rows.len());
+            for r in right_rows {
+                map.entry(norm_val(rk, cell(r, ri))).or_default().push(r);
             }
             let mut out = Vec::with_capacity(rows.len());
             for l in rows {
                 match map.get(&norm_val(lk, cell(&l, li))) {
-                    Some(ps) => for &p in ps {
+                    Some(matches) => for rrow in matches {
                         let mut r = l.clone();
-                        r.extend(rt.rows[p].iter().cloned());
+                        r.extend(rrow.iter().cloned());
                         r.resize(schema.len() + rt.schema.len(), String::new());
                         out.push(r);
                     },
@@ -576,7 +984,12 @@ impl<'a> Table<'a> {
             rows = out;
             schema.extend(qualify(&j.table, &rt.schema));
         }
-        Ok(Rs { schema, rows })
+        let positions: Vec<usize> = plan.schema.iter().map(|wanted| {
+            schema.iter().position(|actual| actual.name == wanted.name)
+                .ok_or_else(|| DbError::SchemaMismatch(format!("Join-Spalte '{}' fehlt", wanted.name)))
+        }).collect::<Result<_>>()?;
+        let rows = rows.into_iter().map(|row| positions.iter().map(|&i| row[i].clone()).collect()).collect();
+        Ok(Rs { schema: plan.schema, rows })
     }
 
     /// where (optional) → group → having → order → select → distinct → skip → limit.
@@ -699,6 +1112,28 @@ impl<'a> Table<'a> {
         }
     }
 
+    /// Executes the query and appends its actual output cardinality and elapsed time.
+    pub fn explain_analyze(&self) -> String {
+        match self.try_explain_analyze() {
+            Ok(s) => s,
+            Err(e) => format!("Fehler: {e}"),
+        }
+    }
+
+    /// Fallible form of [`Table::explain_analyze`].
+    pub fn try_explain_analyze(&self) -> DbResult<String> {
+        self.ctx.read(&|rd| {
+            let plan = self.explain_with(rd)?;
+            let started = Instant::now();
+            let rows = self.exec_with(rd)?.rows.len();
+            let elapsed = started.elapsed();
+            Ok(format!(
+                "{plan}\nANALYZE actual rows={rows} loops=1 elapsed={} us",
+                elapsed.as_micros()
+            ))
+        })
+    }
+
     fn explain_with(&self, rd: &dyn Reader) -> Result<String> {
         let mut lines = Vec::new();
         match &self.src {
@@ -710,15 +1145,27 @@ impl<'a> Table<'a> {
                     let (_, access) = self.positions(&data, &pconds, &order, self.skip, self.limit)?;
                     lines.push(match access {
                         Access::Full => format!("SCAN {name}"),
-                        Access::Lookup { desc, .. } => format!("SEARCH {name} USING INDEX {desc}"),
+                                    Access::Lookup { desc, positions, cost, .. } => format!(
+                                        "SEARCH {name} USING INDEX {desc} (estimated rows={}, cost={cost:.1})",
+                                        positions.len()
+                                    ),
                         Access::OrderScan { col, desc } => format!("SCAN {name} USING INDEX {} ({})",
                             data.schema[col].name, if desc { "absteigend, kein Sortieren" } else { "aufsteigend, kein Sortieren" }),
                     });
                 } else {
-                    lines.push(format!("SCAN {name}"));
-                    for j in joins {
+                    let plan = self.join_plan(rd, name, joins)?;
+                    lines.push(format!(
+                        "SCAN {name} (predicate pushdown: {} rows)",
+                        plan.pushed_rows[0].len()
+                    ));
+                    for &index in &plan.order {
+                        let j = &joins[index];
                         lines.push(format!("{} {} (Hash-Join auf {} = {})",
                             if j.outer { "LEFT JOIN" } else { "JOIN" }, j.table, j.left, j.right));
+                        lines.push(format!(
+                            "  predicate pushdown: {} rows",
+                            plan.pushed_rows[index + 1].len()
+                        ));
                     }
                 }
             }

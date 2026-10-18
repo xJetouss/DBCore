@@ -19,7 +19,7 @@ use chacha20poly1305::aead::{rand_core::RngCore, Aead, AeadCore, KeyInit, OsRng,
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AO};
 use std::sync::Mutex;
@@ -31,6 +31,7 @@ const TAG_LEN: usize = 16;
 const MAGIC_TABLE: &[u8; 4] = b"DBC3";
 const MAGIC_MANIFEST: &[u8; 4] = b"DBM1";
 const MAGIC_WAL: &[u8; 4] = b"DBW1";
+const MAGIC_BACKUP: &[u8; 4] = b"DBB1";
 const X_NONCE_LEN: usize = 24;
 const PREFIX_LEN: usize = 20;
 const ROWS_PER_CHUNK: usize = 1024;
@@ -38,6 +39,7 @@ const CHUNK_BYTES: usize = 256 * 1024;
 const MAX_CHUNK: usize = 256 * 1024 * 1024;
 const MANIFEST: &str = "MANIFEST";
 const WAL: &str = "WAL";
+const BACKUP: &str = "BACKUP";
 
 // ───────────── Index (im Speicher) ─────────────
 
@@ -141,7 +143,139 @@ pub(crate) struct TableData {
     pub(crate) name: String,
     pub(crate) schema: Vec<ColDef>,
     pub(crate) rows: Vec<Vec<String>>,
+    pub(crate) index_defs: Vec<IndexDefinition>,
     idx: Mutex<HashMap<usize, Arc<BIndex>>>,
+    composite_idx: Mutex<HashMap<usize, Arc<CompositeIndex>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IndexTerm {
+    Column(String),
+    Lower(String),
+    Upper(String),
+    Length(String),
+}
+
+impl IndexTerm {
+    pub(crate) fn column(&self) -> &str {
+        match self {
+            Self::Column(column)
+            | Self::Lower(column)
+            | Self::Upper(column)
+            | Self::Length(column) => column,
+        }
+    }
+
+    fn value(&self, schema: &[ColDef], row: &[String]) -> Option<(ColumnKind, String)> {
+        let ci = schema.iter().position(|c| c.name == self.column())?;
+        let raw = cell(row, ci);
+        if raw == NULL_CELL {
+            return Some((ColumnKind::Null, String::new()));
+        }
+        Some(match self {
+            Self::Column(_) => (schema[ci].kind, raw.to_string()),
+            Self::Lower(_) => (ColumnKind::Text, raw.to_lowercase()),
+            Self::Upper(_) => (ColumnKind::Text, raw.to_uppercase()),
+            Self::Length(_) => (ColumnKind::Int, raw.chars().count().to_string()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexDefinition {
+    pub(crate) name: String,
+    pub(crate) terms: Vec<IndexTerm>,
+    pub(crate) included: Vec<String>,
+    pub(crate) predicate: Option<crate::IndexPredicate>,
+}
+
+pub(crate) struct CompositeIndex {
+    map: BTreeMap<Vec<IKey>, Vec<usize>>,
+    covering: HashMap<usize, HashMap<String, String>>,
+}
+
+impl CompositeIndex {
+    fn build(def: &IndexDefinition, schema: &[ColDef], rows: &[Vec<String>]) -> Self {
+        let mut map: BTreeMap<Vec<IKey>, Vec<usize>> = BTreeMap::new();
+        let mut covering = HashMap::new();
+        for (position, row) in rows.iter().enumerate() {
+            if !index_predicate_matches(def.predicate.as_ref(), schema, row) {
+                continue;
+            }
+            let mut stored = HashMap::new();
+            for term in &def.terms {
+                if let IndexTerm::Column(column) = term {
+                    if let Some(ci) = schema.iter().position(|col| &col.name == column) {
+                        stored.insert(column.clone(), cell(row, ci).to_string());
+                    }
+                }
+            }
+            for column in &def.included {
+                if let Some(ci) = schema.iter().position(|col| &col.name == column) {
+                    stored.insert(column.clone(), cell(row, ci).to_string());
+                }
+            }
+            covering.insert(position, stored);
+            let key = def
+                .terms
+                .iter()
+                .filter_map(|term| {
+                    term.value(schema, row)
+                        .map(|(kind, value)| IKey::of(kind, &value))
+                })
+                .collect();
+            map.entry(key).or_default().push(position);
+        }
+        CompositeIndex { map, covering }
+    }
+
+    pub(crate) fn prefix(&self, key: &[IKey]) -> Vec<usize> {
+        self.map
+            .range(key.to_vec()..)
+            .take_while(|(candidate, _)| candidate.starts_with(key))
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn project(
+        &self,
+        positions: &[usize],
+        columns: &[String],
+    ) -> Option<HashMap<usize, Vec<String>>> {
+        positions
+            .iter()
+            .map(|position| {
+                let values = self.covering.get(position)?;
+                let row = columns
+                    .iter()
+                    .map(|column| values.get(column).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                Some((*position, row))
+            })
+            .collect()
+    }
+}
+
+fn index_predicate_matches(
+    predicate: Option<&crate::IndexPredicate>,
+    schema: &[ColDef],
+    row: &[String],
+) -> bool {
+    let Some(predicate) = predicate else {
+        return true;
+    };
+    match predicate {
+        crate::IndexPredicate::Equals { column, value } => schema
+            .iter()
+            .position(|c| &c.name == column)
+            .map(|ci| norm_val(schema[ci].kind, cell(row, ci)) == norm_val(schema[ci].kind, value))
+            .unwrap_or(false),
+        crate::IndexPredicate::IsNotNull(column) => schema
+            .iter()
+            .position(|c| &c.name == column)
+            .map(|ci| cell(row, ci) != NULL_CELL)
+            .unwrap_or(false),
+    }
 }
 
 impl Clone for TableData {
@@ -150,7 +284,9 @@ impl Clone for TableData {
             name: self.name.clone(),
             schema: self.schema.clone(),
             rows: self.rows.clone(),
+            index_defs: self.index_defs.clone(),
             idx: Mutex::new(HashMap::new()),
+            composite_idx: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -161,8 +297,14 @@ impl TableData {
             name,
             schema,
             rows,
+            index_defs: Vec::new(),
             idx: Mutex::new(HashMap::new()),
+            composite_idx: Mutex::new(HashMap::new()),
         }
+    }
+    pub(crate) fn with_indexes(mut self, index_defs: Vec<IndexDefinition>) -> Self {
+        self.index_defs = index_defs;
+        self
     }
     pub(crate) fn col(&self, name: &str) -> Option<usize> {
         self.schema.iter().position(|c| c.name == name)
@@ -177,9 +319,28 @@ impl TableData {
             .or_insert_with(|| Arc::new(BIndex::build(self.schema[ci].kind, &self.rows, ci)))
             .clone()
     }
+    pub(crate) fn composite_index(&self, index: usize) -> Arc<CompositeIndex> {
+        let mut g = self
+            .composite_idx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        g.entry(index)
+            .or_insert_with(|| {
+                Arc::new(CompositeIndex::build(
+                    &self.index_defs[index],
+                    &self.schema,
+                    &self.rows,
+                ))
+            })
+            .clone()
+    }
     /// Vor jeder Änderung aufrufen: verwirft die gebauten Indizes.
     pub(crate) fn touch(&mut self) {
         self.idx
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.composite_idx
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
@@ -244,6 +405,139 @@ impl Manifest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupKind {
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Clone)]
+struct BackupInfo {
+    id: String,
+    parent: Option<String>,
+    kind: BackupKind,
+}
+
+impl BackupInfo {
+    fn encode(&self) -> String {
+        match &self.parent {
+            Some(parent) => format!(
+                "BACKUP:1\nKIND:INCREMENTAL\nID:{}\nPARENT:{parent}\n",
+                self.id
+            ),
+            None => format!("BACKUP:1\nKIND:FULL\nID:{}\n", self.id),
+        }
+    }
+
+    fn decode(text: &str) -> Result<Self> {
+        let mut lines = text.lines();
+        if lines.next() != Some("BACKUP:1") {
+            return Err(DbError::Corrupt("Backup-Metadaten: Kopf fehlt"));
+        }
+        let kind = match lines.next() {
+            Some("KIND:FULL") => BackupKind::Full,
+            Some("KIND:INCREMENTAL") => BackupKind::Incremental,
+            _ => return Err(DbError::Corrupt("Backup-Metadaten: Typ")),
+        };
+        let id = lines
+            .next()
+            .and_then(|line| line.strip_prefix("ID:"))
+            .filter(|id| valid_backup_id(id))
+            .ok_or(DbError::Corrupt("Backup-Metadaten: ID"))?
+            .to_string();
+        let parent = match (kind, lines.next()) {
+            (BackupKind::Full, None) => None,
+            (BackupKind::Incremental, Some(line)) => Some(
+                line.strip_prefix("PARENT:")
+                    .filter(|id| valid_backup_id(id))
+                    .ok_or(DbError::Corrupt("Backup-Metadaten: Vorgänger"))?
+                    .to_string(),
+            ),
+            _ => return Err(DbError::Corrupt("Backup-Metadaten: Vorgänger")),
+        };
+        if lines.next().is_some() {
+            return Err(DbError::Corrupt("Backup-Metadaten: zusätzliche Daten"));
+        }
+        Ok(BackupInfo { id, parent, kind })
+    }
+}
+
+fn valid_backup_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn backup_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+struct StagingDir {
+    path: PathBuf,
+    published: bool,
+}
+
+impl StagingDir {
+    fn create(destination: &Path) -> Result<Self> {
+        if destination.exists() {
+            return Err(
+                io::Error::new(io::ErrorKind::AlreadyExists, "Ziel existiert bereits").into(),
+            );
+        }
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(DbError::InvalidName)?;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..32 {
+            let suffix = NEXT.fetch_add(1, AO::Relaxed);
+            let path = parent.join(format!(
+                ".{name}.dbcore-tmp-{}-{suffix}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        published: false,
+                    })
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "temporäres Zielverzeichnis nicht verfügbar",
+        )
+        .into())
+    }
+
+    fn publish(mut self, destination: &Path) -> Result<()> {
+        if destination.exists() {
+            return Err(
+                io::Error::new(io::ErrorKind::AlreadyExists, "Ziel existiert bereits").into(),
+            );
+        }
+        fs::rename(&self.path, destination)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 // ───────────── Kopf-Text (Schema + Constraints) ─────────────
 
 fn esc_field(s: &str) -> String {
@@ -299,7 +593,7 @@ fn schema_line(cols: &[ColDef]) -> String {
     out
 }
 
-pub(crate) fn header_text(name: &str, cols: &[ColDef]) -> String {
+pub(crate) fn header_text(name: &str, cols: &[ColDef], indexes: &[IndexDefinition]) -> String {
     let mut h = format!("TABLE:{name}\nCOLS:{}\nFORMAT:4\n", schema_line(cols));
     for c in cols {
         if c.not_null {
@@ -329,10 +623,46 @@ pub(crate) fn header_text(name: &str, cols: &[ColDef]) -> String {
             ));
         }
     }
+    for index in indexes {
+        let mut fields = vec![index.name.clone(), index.terms.len().to_string()];
+        for term in &index.terms {
+            let (kind, column) = match term {
+                IndexTerm::Column(c) => ("C", c),
+                IndexTerm::Lower(c) => ("L", c),
+                IndexTerm::Upper(c) => ("U", c),
+                IndexTerm::Length(c) => ("N", c),
+            };
+            fields.push(kind.into());
+            fields.push(column.clone());
+        }
+        fields.push(index.included.len().to_string());
+        fields.extend(index.included.iter().cloned());
+        match &index.predicate {
+            Some(crate::IndexPredicate::Equals { column, value }) => {
+                fields.push("E".into());
+                fields.push(column.clone());
+                fields.push(value.clone());
+            }
+            Some(crate::IndexPredicate::IsNotNull(column)) => {
+                fields.push("Z".into());
+                fields.push(column.clone());
+            }
+            None => fields.push("-".into()),
+        }
+        h.push_str("IDF:");
+        h.push_str(
+            &fields
+                .iter()
+                .map(|field| esc_field(field))
+                .collect::<Vec<_>>()
+                .join(":"),
+        );
+        h.push('\n');
+    }
     h
 }
 
-pub(crate) fn parse_header(text: &str, name: &str) -> Result<Vec<ColDef>> {
+pub(crate) fn parse_header(text: &str, name: &str) -> Result<(Vec<ColDef>, Vec<IndexDefinition>)> {
     let cols_line = text
         .lines()
         .find(|l| l.starts_with("COLS:"))
@@ -355,10 +685,101 @@ pub(crate) fn parse_header(text: &str, name: &str) -> Result<Vec<ColDef>> {
             cols.push(ColumnDef::new(n, kind, default, key));
         }
     }
+    let mut indexes = Vec::new();
     for line in text.lines() {
         let Some((tag, rest)) = line.split_once(':') else {
             continue;
         };
+        if tag == "IDF" {
+            let fields = split_fields(rest);
+            let mut at = 0;
+            let index_name = fields
+                .get(at)
+                .filter(|name| valid_name(name))
+                .ok_or(DbError::Corrupt("Indexdefinition: Name"))?
+                .clone();
+            at += 1;
+            let term_count: usize = fields
+                .get(at)
+                .ok_or(DbError::Corrupt("Indexdefinition: Terme"))?
+                .parse()
+                .map_err(|_| DbError::Corrupt("Indexdefinition: Terme"))?;
+            at += 1;
+            let mut terms = Vec::with_capacity(term_count);
+            for _ in 0..term_count {
+                let kind = fields
+                    .get(at)
+                    .ok_or(DbError::Corrupt("Indexdefinition: Ausdruck"))?;
+                let column = fields
+                    .get(at + 1)
+                    .filter(|column| valid_name(column))
+                    .ok_or(DbError::Corrupt("Indexdefinition: Spalte"))?
+                    .clone();
+                terms.push(match kind.as_str() {
+                    "C" => IndexTerm::Column(column),
+                    "L" => IndexTerm::Lower(column),
+                    "U" => IndexTerm::Upper(column),
+                    "N" => IndexTerm::Length(column),
+                    _ => return Err(DbError::Corrupt("Indexdefinition: Ausdruck")),
+                });
+                at += 2;
+            }
+            if terms.is_empty() {
+                return Err(DbError::Corrupt("Indexdefinition: keine Terme"));
+            }
+            let included_count: usize = fields
+                .get(at)
+                .ok_or(DbError::Corrupt("Indexdefinition: INCLUDE"))?
+                .parse()
+                .map_err(|_| DbError::Corrupt("Indexdefinition: INCLUDE"))?;
+            at += 1;
+            let mut included = Vec::with_capacity(included_count);
+            for _ in 0..included_count {
+                included.push(
+                    fields
+                        .get(at)
+                        .filter(|column| valid_name(column))
+                        .ok_or(DbError::Corrupt("Indexdefinition: INCLUDE-Spalte"))?
+                        .clone(),
+                );
+                at += 1;
+            }
+            let predicate = match fields.get(at).map(String::as_str) {
+                Some("-") if at + 1 == fields.len() => None,
+                Some("Z") if at + 2 == fields.len() => {
+                    Some(crate::IndexPredicate::IsNotNull(fields[at + 1].clone()))
+                }
+                Some("E") if at + 3 == fields.len() => Some(crate::IndexPredicate::Equals {
+                    column: fields[at + 1].clone(),
+                    value: fields[at + 2].clone(),
+                }),
+                _ => return Err(DbError::Corrupt("Indexdefinition: Prädikat")),
+            };
+            if terms
+                .iter()
+                .any(|term| !cols.iter().any(|c| c.name == term.column()))
+                || included
+                    .iter()
+                    .any(|column| !cols.iter().any(|c| &c.name == column))
+                || predicate
+                    .as_ref()
+                    .map_or(false, |predicate| match predicate {
+                        crate::IndexPredicate::Equals { column, .. }
+                        | crate::IndexPredicate::IsNotNull(column) => {
+                            !cols.iter().any(|c| &c.name == column)
+                        }
+                    })
+            {
+                return Err(DbError::Corrupt("Indexdefinition: unbekannte Spalte"));
+            }
+            indexes.push(IndexDefinition {
+                name: index_name,
+                terms,
+                included,
+                predicate,
+            });
+            continue;
+        }
         if !matches!(tag, "NN" | "UQ" | "IX" | "CK" | "FK") {
             continue;
         }
@@ -392,7 +813,7 @@ pub(crate) fn parse_header(text: &str, name: &str) -> Result<Vec<ColDef>> {
             _ => {}
         }
     }
-    Ok(cols)
+    Ok((cols, indexes))
 }
 
 // ───────────── Store ─────────────
@@ -573,6 +994,214 @@ impl Store {
     }
     pub(crate) fn path(&self, fname: &str) -> PathBuf {
         self.dir.join(fname)
+    }
+
+    pub(crate) fn backup_to(self: &Arc<Self>, destination: &Path) -> Result<()> {
+        let snapshot = self.snapshot_pinned()?;
+        self.backup_snapshot_to(&snapshot, destination)
+    }
+
+    fn backup_snapshot_to(&self, snapshot: &Snapshot, destination: &Path) -> Result<()> {
+        let staging = StagingDir::create(destination)?;
+        fs::copy(self.dir.join(".key"), staging.path.join(".key"))?;
+        self.write_snapshot_manifest(&staging.path, &snapshot.manifest)?;
+        for (name, fname) in &snapshot.manifest.tables {
+            snapshot.copy_table_file(name, &staging.path.join(fname))?;
+        }
+        self.write_backup_info(
+            &staging.path,
+            &BackupInfo {
+                id: backup_id(),
+                parent: None,
+                kind: BackupKind::Full,
+            },
+        )?;
+        staging.publish(destination)
+    }
+
+    pub(crate) fn backup_incremental_to(
+        self: &Arc<Self>,
+        previous: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        let (previous_store, previous_info) = Self::open_backup(previous)?;
+        if fs::read(self.dir.join(".key"))? != fs::read(previous.join(".key"))? {
+            return Err(DbError::Crypto(
+                "Inkrementelles Backup gehört zu einer anderen Datenbank",
+            ));
+        }
+        let previous_manifest = previous_store.read_manifest()?;
+        let snapshot = self.snapshot_pinned()?;
+        let staging = StagingDir::create(destination)?;
+        fs::copy(self.dir.join(".key"), staging.path.join(".key"))?;
+        self.write_snapshot_manifest(&staging.path, &snapshot.manifest)?;
+        for (name, fname) in &snapshot.manifest.tables {
+            if previous_manifest.tables.get(name) != Some(fname) {
+                snapshot.copy_table_file(name, &staging.path.join(fname))?;
+            }
+        }
+        self.write_backup_info(
+            &staging.path,
+            &BackupInfo {
+                id: backup_id(),
+                parent: Some(previous_info.id),
+                kind: BackupKind::Incremental,
+            },
+        )?;
+        staging.publish(destination)
+    }
+
+    fn write_snapshot_manifest(&self, dir: &Path, manifest: &Manifest) -> Result<()> {
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ct = self
+            .x
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: manifest.encode().as_bytes(),
+                    aad: b"DBC3-MANIFEST",
+                },
+            )
+            .map_err(|_| DbError::Crypto("Manifest: Verschlüsselung fehlgeschlagen"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(MANIFEST))?;
+        file.write_all(MAGIC_MANIFEST)?;
+        file.write_all(&nonce)?;
+        file.write_all(&ct)?;
+        if self.do_sync() {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn write_backup_info(&self, dir: &Path, info: &BackupInfo) -> Result<()> {
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ct = self
+            .x
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: info.encode().as_bytes(),
+                    aad: b"DBC3-BACKUP",
+                },
+            )
+            .map_err(|_| DbError::Crypto("Backup-Metadaten: Verschlüsselung fehlgeschlagen"))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(BACKUP))?;
+        file.write_all(MAGIC_BACKUP)?;
+        file.write_all(&nonce)?;
+        file.write_all(&ct)?;
+        if self.do_sync() {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn open_backup(path: &Path) -> Result<(Arc<Store>, BackupInfo)> {
+        let store = Self::open(path.to_path_buf(), false)?;
+        let raw = fs::read(path.join(BACKUP))?;
+        if raw.len() < 4 + X_NONCE_LEN + TAG_LEN || &raw[..4] != MAGIC_BACKUP {
+            return Err(DbError::Corrupt(
+                "Backup-Metadaten beschädigt oder unvollständig",
+            ));
+        }
+        let (nonce, ct) = raw[4..].split_at(X_NONCE_LEN);
+        let plain = store
+            .x
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: b"DBC3-BACKUP",
+                },
+            )
+            .map_err(|_| DbError::Crypto("Backup-Metadaten: Authentifizierung fehlgeschlagen"))?;
+        let text =
+            String::from_utf8(plain).map_err(|_| DbError::Corrupt("Backup-Metadaten: UTF-8"))?;
+        let info = BackupInfo::decode(&text)?;
+        Ok((store, info))
+    }
+
+    pub(crate) fn verify_backup(path: &Path) -> Result<Vec<String>> {
+        let (store, info) = Self::open_backup(path)?;
+        if info.kind != BackupKind::Full {
+            return Err(DbError::Unsupported(
+                "Ein inkrementelles Backup muss mit seiner Backup-Kette geprüft werden".into(),
+            ));
+        }
+        store.integrity_check()
+    }
+
+    pub(crate) fn verify_backup_chain(base: &Path, increments: &[PathBuf]) -> Result<Vec<String>> {
+        let temp = std::env::temp_dir().join(format!(
+            "dbcore-verify-{}-{}",
+            std::process::id(),
+            backup_id()
+        ));
+        let staging = StagingDir::create(&temp)?;
+        Self::apply_backup_chain(base, increments, &staging.path)?;
+        let store = Self::open(staging.path.clone(), false)?;
+        store.integrity_check()
+    }
+
+    pub(crate) fn restore_from(
+        base: &Path,
+        increments: &[PathBuf],
+        destination: &Path,
+    ) -> Result<()> {
+        let staging = StagingDir::create(destination)?;
+        Self::apply_backup_chain(base, increments, &staging.path)?;
+        let restored = Self::open(staging.path.clone(), false)?;
+        let problems = restored.integrity_check()?;
+        if !problems.is_empty() {
+            return Err(DbError::BackupIntegrity(problems));
+        }
+        staging.publish(destination)
+    }
+
+    fn apply_backup_chain(base: &Path, increments: &[PathBuf], destination: &Path) -> Result<()> {
+        let (base_store, base_info) = Self::open_backup(base)?;
+        if base_info.kind != BackupKind::Full {
+            return Err(DbError::Corrupt(
+                "Backup-Kette muss mit einem Vollbackup beginnen",
+            ));
+        }
+        let mut current_manifest = base_store.read_manifest()?;
+        fs::copy(base.join(".key"), destination.join(".key"))?;
+        fs::copy(base.join(MANIFEST), destination.join(MANIFEST))?;
+        for fname in current_manifest.tables.values() {
+            fs::copy(base.join(fname), destination.join(fname))?;
+        }
+        fs::copy(base.join(BACKUP), destination.join(BACKUP))?;
+        let mut parent_id = base_info.id;
+        for increment in increments {
+            let (increment_store, info) = Self::open_backup(increment)?;
+            if info.kind != BackupKind::Incremental || info.parent.as_deref() != Some(&parent_id) {
+                return Err(DbError::Corrupt(
+                    "Inkrementelles Backup passt nicht zur Backup-Kette",
+                ));
+            }
+            if fs::read(base.join(".key"))? != fs::read(increment.join(".key"))? {
+                return Err(DbError::Crypto(
+                    "Backup-Kette verwendet unterschiedliche Schlüssel",
+                ));
+            }
+            let next_manifest = increment_store.read_manifest()?;
+            for (name, fname) in &next_manifest.tables {
+                if current_manifest.tables.get(name) != Some(fname) {
+                    fs::copy(increment.join(fname), destination.join(fname))?;
+                }
+            }
+            fs::copy(increment.join(MANIFEST), destination.join(MANIFEST))?;
+            fs::copy(increment.join(BACKUP), destination.join(BACKUP))?;
+            current_manifest = next_manifest;
+            parent_id = info.id;
+        }
+        Ok(())
     }
 
     /// Entfernt Tabellenversionen, die kein aktuelles Manifest mehr referenziert.
@@ -862,6 +1491,7 @@ impl Store {
         name: &str,
         schema: &[ColDef],
         rows: &[Vec<String>],
+        indexes: &[IndexDefinition],
         seq: u64,
     ) -> Result<String> {
         let fname = format!("{name}.{seq:016x}.tbl");
@@ -884,7 +1514,7 @@ impl Store {
             idx: 0,
             pending: None,
         };
-        cw.push(header_text(name, schema).into_bytes())?;
+        cw.push(header_text(name, schema, indexes).into_bytes())?;
         let mut buf = String::new();
         let mut n = 0usize;
         for r in rows {
@@ -932,7 +1562,7 @@ impl Store {
             )
             .map_err(|_| DbError::Crypto("Entschlüsselung fehlgeschlagen"))?;
         let text = String::from_utf8(plain).map_err(|_| DbError::Corrupt("kein gültiges UTF-8"))?;
-        let schema = parse_header(&text, name)?;
+        let (schema, indexes) = parse_header(&text, name)?;
         let (_h, mut rows) = split_rows(&text);
         for r in rows.iter_mut() {
             r.resize(schema.len(), NULL_CELL.to_string());
@@ -942,7 +1572,7 @@ impl Store {
                 }
             }
         }
-        Ok(TableData::new(name.to_string(), schema, rows))
+        Ok(TableData::new(name.to_string(), schema, rows).with_indexes(indexes))
     }
 
     fn open_chunks(self: &Arc<Self>, br: &mut BufReader<File>, name: &str) -> Result<ChunkReader> {
@@ -970,12 +1600,12 @@ impl Store {
         let head = cr.next(&mut br)?.ok_or(DbError::Corrupt("Kopf fehlt"))?;
         let header = String::from_utf8(head).map_err(|_| DbError::Corrupt("UTF-8"))?;
         let legacy_nulls = !header.lines().any(|l| l == "FORMAT:4");
-        let schema = parse_header(&header, name)?;
+        let (schema, indexes) = parse_header(&header, name)?;
         let mut rows = Vec::new();
         while let Some(chunk) = cr.next(&mut br)? {
             parse_rows_chunk(&chunk, schema.len(), legacy_nulls, &mut rows)?;
         }
-        Ok(TableData::new(name.to_string(), schema, rows))
+        Ok(TableData::new(name.to_string(), schema, rows).with_indexes(indexes))
     }
 
     /// Liest und prüft eine komplette Tabellendatei (v3, Fallback v1/v2).
@@ -1041,6 +1671,7 @@ impl Store {
                 &String::from_utf8(head).map_err(|_| DbError::Corrupt("UTF-8"))?,
                 name,
             )?
+            .0
         } else {
             self.read_legacy_bytes(&fs::read(&path)?, name)?.schema
         };
@@ -1458,7 +2089,7 @@ impl Store {
         let head = cr.next(&mut br)?.ok_or(DbError::Corrupt("Kopf fehlt"))?;
         let header = String::from_utf8(head).map_err(|_| DbError::Corrupt("UTF-8"))?;
         let legacy_nulls = !header.lines().any(|l| l == "FORMAT:4");
-        let schema = parse_header(&header, name)?;
+        let (schema, _) = parse_header(&header, name)?;
         Ok(Scan {
             schema,
             src: ScanSrc::File {
@@ -1496,6 +2127,25 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    fn copy_table_file(&self, table: &str, destination: &Path) -> Result<()> {
+        let pin = self
+            .pins
+            .as_ref()
+            .and_then(|pins| pins.get(table))
+            .ok_or(DbError::SnapshotExpired)?;
+        let mut source = pin.lock().unwrap_or_else(|p| p.into_inner());
+        source.seek(SeekFrom::Start(0))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        std::io::copy(&mut *source, &mut output)?;
+        if self.store.do_sync() {
+            output.sync_all()?;
+        }
+        Ok(())
+    }
+
     pub fn tables(&self) -> Vec<String> {
         self.manifest.tables.keys().cloned().collect()
     }
@@ -1509,6 +2159,11 @@ impl Snapshot {
     /// Abfrage auf diesem Snapshot.
     pub fn table<'a>(&'a self, name: &str) -> Table<'a> {
         Table::on_snapshot(self, name)
+    }
+
+    /// Erstellt ein konsistentes Online-Backup genau dieses Snapshots.
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> DbResult<()> {
+        self.store.backup_snapshot_to(self, destination.as_ref())
     }
 
     pub(crate) fn schema(&self, name: &str) -> Result<Arc<Vec<ColDef>>> {
@@ -1545,7 +2200,7 @@ impl Snapshot {
             let mut reader = BufReader::new(file.try_clone()?);
             let mut chunks = self.store.open_chunks(&mut reader, name)?;
             let header = chunks.next_no_last_check(&mut reader)?;
-            let schema = parse_header(
+            let (schema, _) = parse_header(
                 &String::from_utf8(header).map_err(|_| DbError::Corrupt("UTF-8"))?,
                 name,
             )?;

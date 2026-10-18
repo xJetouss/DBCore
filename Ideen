@@ -1,5 +1,5 @@
 #	Thema	Inhalt	Aufwand
-P7	SQL-Subset & Prepared Statements	Parser (SELECT … WHERE x = $1), Abbildung auf den bestehenden Planer, Prepared Statements, berechnete Spalten, CASE, String-Funktionen	🟡–🔴
+
 
 Abhängigkeiten: P3 (Typen) zuerst, denn P4, P6 und P7 bauen darauf auf. P1 (WAL) vor P2 (MVCC), weil die Nebenläufigkeit auf dem Log aufsetzt. Mit P5 kannst du früh anfangen, weil du die Snapshots schon hast.
 

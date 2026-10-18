@@ -1197,6 +1197,21 @@ impl<'a> Table<'a> {
         Ok(rs.rows.iter().map(|r| display_row(&rs.schema, r)).collect())
     }
 
+    /// Returns all selected rows as typed values, preserving SQL NULL.
+    pub fn try_collect_values(&self) -> DbResult<Vec<Vec<Value>>> {
+        let rs = self.execute()?;
+        rs.rows
+            .iter()
+            .map(|row| {
+                rs.schema
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| Row::new(&rs.schema, row).get_value_at(index))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Erste Zeile. Leerer `Vec` = keine Treffer.
     pub fn first(&self) -> Vec<String> { self.try_first().ok().flatten().unwrap_or_default() }
     pub fn try_first(&self) -> DbResult<Option<Vec<String>>> {

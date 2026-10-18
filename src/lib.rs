@@ -1,7 +1,7 @@
 //! # DBCore – eingebettete, verschlüsselte Datenbank mit Query-Builder
 //!
-//! Kleine Rust-Datenbank ohne SQL-Parser: Schema per Makro, Abfragen per
-//! Builder, alles auf Platte mit ChaCha20-Poly1305 verschlüsselt und
+//! Kleine Rust-Datenbank mit SQL-Subset und Query-Builder: Schema per Makro,
+//! Abfragen per Builder oder vorbereiteten SELECT-Anweisungen, alles auf Platte mit ChaCha20-Poly1305 verschlüsselt und
 //! authentifiziert. Seit Version 0.2 mit Transaktionen, Crash-Sicherheit,
 //! Multi-Thread/Multi-Prozess-Zugriff, Indizes, Constraints und Joins.
 //!
@@ -131,6 +131,16 @@
 //! Hinweis: Der Index lebt im Speicher pro Tabellenstand (Aufbau einmalig
 //! O(n log n) nach jeder Änderung); die Definition ist persistent.
 //!
+//! ## 7. SQL-Subset und Prepared Statements
+//! `db.prepare("SELECT id FROM users WHERE id = $1")` parst einen SELECT
+//! einmalig und liefert ein wiederverwendbares `PreparedStatement`. `query`
+//! und `explain` binden nummerierte `$1`-Parameter typsicher. Unterstützt
+//! werden Spalten/`*`, Vergleiche mit `AND`, `IS [NOT] NULL`, `LIKE`,
+//! `ORDER BY`, `LIMIT`, Arithmetik, `CASE` sowie `LOWER`, `UPPER`, `TRIM`,
+//! `LENGTH`, `CONCAT` und `SUBSTR`. WHERE-Prädikate laufen über den bestehenden
+//! Query-Planer; Joins, Aggregationen und Änderungen sind nicht Teil dieses
+//! SQL-Subsets.
+//!
 //! ## 6. Constraints
 //! ```no_run
 //! # use dbcore::*;
@@ -185,6 +195,7 @@ use std::{error, fmt};
 
 mod format;
 mod query;
+mod sql;
 mod store;
 mod tx;
 mod web;
@@ -195,6 +206,7 @@ pub(crate) use store::{Store, TableData};
 pub use query::{
     Agg, ColumnStatistics, HistogramBucket, Order, RowStream, Rows, Table, TableStatistics,
 };
+pub use sql::{PreparedStatement, SqlResult};
 pub use store::Snapshot;
 pub use tx::Tx;
 
@@ -291,7 +303,7 @@ impl Value {
         }
     }
 
-    fn as_input(&self) -> String {
+    pub(crate) fn as_input(&self) -> String {
         match self {
             Value::Null => NULL_CELL.to_string(),
             Value::Int(v) => v.to_string(),
@@ -1195,6 +1207,7 @@ pub enum DbError {
     Crypto(&'static str),
     Corrupt(&'static str),
     BackupIntegrity(Vec<String>),
+    Sql(String),
     InvalidName,
     TableExists(String),
     TableNotFound(String),
@@ -1239,6 +1252,7 @@ impl fmt::Display for DbError {
                     problems.join("; ")
                 )
             }
+            DbError::Sql(message) => write!(f, "SQL-Fehler: {message}"),
             DbError::InvalidName => write!(f, "Ungültiger Name (erlaubt: a-z A-Z 0-9 _ -)"),
             DbError::TableExists(n) => write!(f, "Tabelle '{n}' existiert bereits"),
             DbError::TableNotFound(n) => write!(f, "Tabelle '{n}' nicht gefunden"),
@@ -2186,6 +2200,11 @@ impl DBCore {
     pub fn try_tables(&self) -> DbResult<Vec<String>> {
         Ok(self.st()?.snapshot()?.tables())
     }
+    /// Reads the schema from one consistent snapshot without scanning table rows.
+    pub fn try_schema(&self, table: &str) -> DbResult<Vec<ColumnDef>> {
+        self.st()?
+            .with_snapshot(|snapshot| Ok(snapshot.schema(table)?.as_ref().clone()))
+    }
     pub fn has_table(&self, table: &str) -> bool {
         valid_name(table) && report(self.try_has_table(table)).unwrap_or(false)
     }
@@ -2333,6 +2352,11 @@ impl DBCore {
     /// ```
     pub fn table<'a>(&'a self, name: &str) -> Table<'a> {
         Table::on_db(self, name)
+    }
+
+    /// Parses and prepares the supported SELECT subset for repeated execution.
+    pub fn prepare(&self, sql: &str) -> DbResult<PreparedStatement> {
+        PreparedStatement::parse(sql)
     }
 
     // ───── Schema-Änderungen (Migrationen) ─────

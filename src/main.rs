@@ -598,6 +598,174 @@ fn main() {
                 let _ = std::fs::remove_dir_all(cover);
             },
         );
+        println!("\n▌ P7 SQL-Subset & Prepared Statements");
+        r.run(
+            "Prepared SELECT bindet Parameter und verwendet den bestehenden Planer",
+            || {
+                let d = db();
+                d.create(
+                    "sql_events",
+                    schema! {
+                        @key id: i32,
+                        user_id: i32,
+                        score: i32,
+                        name: String,
+                        note: Option<String>
+                    }
+                    .index(&["user_id"]),
+                );
+                assert!(d.add_many(
+                    "sql_events",
+                    (1..=100)
+                        .map(|id| row! {
+                            id: id,
+                            user_id: id % 10,
+                            score: id,
+                            name: format!(" User{id} ")
+                        })
+                        .collect(),
+                ));
+                let statement = d
+                    .prepare(
+                        "SELECT id, name FROM sql_events \
+                         WHERE user_id = $1 AND score >= $2 \
+                         ORDER BY id DESC LIMIT 3",
+                    )
+                    .unwrap();
+                assert_eq!(statement.parameter_count(), 2);
+                let result = statement
+                    .query(&d, &[Value::Int(3), Value::Int(50)])
+                    .unwrap();
+                assert_eq!(result.columns, ["id", "name"]);
+                assert_eq!(
+                    result.rows,
+                    vec![
+                        vec![Value::Int(93), Value::Text(" User93 ".into())],
+                        vec![Value::Int(83), Value::Text(" User83 ".into())],
+                        vec![Value::Int(73), Value::Text(" User73 ".into())],
+                    ]
+                );
+                assert!(statement
+                    .explain(&d, &[Value::Int(3), Value::Int(50)])
+                    .unwrap()
+                    .contains("USING INDEX user_id"));
+                assert_eq!(
+                    statement
+                        .query(&d, &[Value::Int(4), Value::Int(90)])
+                        .unwrap()
+                        .rows,
+                    vec![vec![Value::Int(94), Value::Text(" User94 ".into())]]
+                );
+                d.try_create_expression_index("sql_events", IndexExpression::lower("name"))
+                    .unwrap();
+                let expression = d
+                    .prepare(
+                        "SELECT sql_events.id FROM sql_events \
+                         WHERE LOWER(sql_events.name) = $1",
+                    )
+                    .unwrap();
+                assert!(expression
+                    .explain(&d, &[Value::Text(" user53 ".into())])
+                    .unwrap()
+                    .contains("USING INDEX idx_"));
+                assert_eq!(
+                    expression
+                        .query(&d, &[Value::Text(" user53 ".into())])
+                        .unwrap()
+                        .rows,
+                    vec![vec![Value::Int(53)]]
+                );
+                assert!(matches!(
+                    statement.query(&d, &[Value::Int(3)]),
+                    Err(DbError::Sql(_))
+                ));
+            },
+        );
+        r.run(
+            "SQL-Ausdrücke, CASE, String-Funktionen und NULL-Semantik",
+            || {
+                let d = db();
+                d.create(
+                    "sql_events",
+                    schema! {
+                        @key id: i32,
+                        score: i32,
+                        name: String,
+                        note: Option<String>
+                    },
+                );
+                assert!(d.add("sql_events", row! { id: 53, score: 53, name: " User53 " }));
+                let calculated = d
+                    .prepare(
+                        "SELECT score * 2 + $1 AS adjusted, \
+                         CASE WHEN score >= 50 THEN 'high' ELSE 'low' END AS band, \
+                         LOWER(name) AS normalized, LENGTH(name) AS chars, \
+                         CONCAT(TRIM(name), '!') AS greeting, \
+                         SUBSTR(name, 2, 4) AS short \
+                         FROM sql_events WHERE id = $2",
+                    )
+                    .unwrap();
+                let result = calculated
+                    .execute(&d, &[Value::Int(5), Value::Int(53)])
+                    .unwrap();
+                assert_eq!(
+                    result.columns,
+                    ["adjusted", "band", "normalized", "chars", "greeting", "short"]
+                );
+                assert_eq!(
+                    result.rows,
+                    vec![vec![
+                        Value::Int(111),
+                        Value::Text("high".into()),
+                        Value::Text(" user53 ".into()),
+                        Value::Int(8),
+                        Value::Text("User53!".into()),
+                        Value::Text("User".into()),
+                    ]]
+                );
+
+                let nulls = d
+                    .prepare("SELECT id, note FROM sql_events WHERE note IS NULL")
+                    .unwrap()
+                    .query(&d, &[])
+                    .unwrap();
+                assert_eq!(
+                    nulls.rows,
+                    vec![vec![Value::Int(53), Value::Null]]
+                );
+                let wildcard = d
+                    .prepare("SELECT * FROM sql_events WHERE id = $1")
+                    .unwrap()
+                    .query(&d, &[Value::Int(53)])
+                    .unwrap();
+                assert_eq!(wildcard.columns, ["id", "score", "name", "note"]);
+                assert_eq!(wildcard.rows[0][3], Value::Null);
+                let distinct = d
+                    .prepare("SELECT DISTINCT score % 2 AS parity FROM sql_events")
+                    .unwrap()
+                    .query(&d, &[])
+                    .unwrap();
+                assert_eq!(
+                    distinct.rows,
+                    vec![vec![Value::Int(1)]]
+                );
+            },
+        );
+        r.run("SQL-Parser meldet ungültige Syntax und Parameterpositionen", || {
+            let d = db();
+            assert!(matches!(
+                d.prepare("SELECT id FROM t WHERE id = $2"),
+                Err(DbError::Sql(_))
+            ));
+            assert!(matches!(
+                d.prepare("SELECT id FROM t WHERE id = $1 OR id = $2"),
+                Err(DbError::Sql(_))
+            ));
+            assert!(matches!(
+                d.prepare("SELECT mystery(name) FROM t"),
+                Err(DbError::Sql(_))
+            ));
+        });
         println!("\n▌ P4 Query-Optimizer");
         r.run("Statistiken, Histogramme, Kostenwahl, Join-Pushdown und EXPLAIN ANALYZE", || {
             let d = db();
